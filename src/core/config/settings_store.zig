@@ -334,27 +334,11 @@ pub const Store = struct {
         };
     }
 
-    /// Opens the passport store for this home when the backend is enabled.
-    /// Misconfigured enabled state propagates rather than silently falling
-    /// back to local settings.
-    fn openPassportStore(alloc: Allocator, home_path: []const u8) !?*store_redirect.Store {
-        var store = try store_redirect.Store.open(alloc, home_path);
-        if (!store.passportEnabled()) {
-            store.deinit();
-            return null;
-        }
-        const ptr = try alloc.create(store_redirect.Store);
-        errdefer alloc.destroy(ptr);
-        ptr.* = store;
-        return ptr;
-    }
-
     pub fn initFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode) !Store {
-        const passport = try openPassportStore(alloc, home_path);
-        errdefer if (passport) |p| {
-            p.deinit();
-            alloc.destroy(p);
-        };
+        // Misconfigured enabled state propagates rather than silently
+        // falling back to local settings.
+        const passport = try store_redirect.openEnabled(alloc, home_path);
+        errdefer if (passport) |p| store_redirect.destroyOwned(p);
         const zio = io_mod.getIo();
         var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
@@ -410,10 +394,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
         self.last_failure_cleanup.deinit(alloc);
-        if (self.passport) |p| {
-            p.deinit();
-            alloc.destroy(p);
-        }
+        if (self.passport) |p| store_redirect.destroyOwned(p);
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.display_root);
         self.* = undefined;
@@ -725,7 +706,9 @@ pub const Store = struct {
         while (try iterator.next(io_mod.getIo())) |entry| {
             if (!std.mem.startsWith(u8, entry.name, "settings.json.backup.")) continue;
             if (parseBackupTimestamp(entry.name) == null) continue;
-            try names.append(alloc, try alloc.dupe(u8, entry.name));
+            const owned_name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(owned_name);
+            try names.append(alloc, owned_name);
         }
         sort_utils.sort([]u8, names.items, {}, struct {
             fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
@@ -2078,7 +2061,9 @@ fn pruneSequencedCopies(
     var iterator = dir.iterate();
     while (try iterator.next(io_mod.getIo())) |entry| {
         if (!std.mem.startsWith(u8, entry.name, prefix) or parseBackupTimestamp(entry.name) == null) continue;
-        try names.append(alloc, try alloc.dupe(u8, entry.name));
+        const owned_name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(owned_name);
+        try names.append(alloc, owned_name);
     }
     sort_utils.sort([]u8, names.items, {}, struct {
         fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {

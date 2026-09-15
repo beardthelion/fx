@@ -229,26 +229,7 @@ fn writeCanonical(
 /// JSON.stringify-compatible string encoding: escapes ", \, and control
 /// characters below 0x20 (short escapes where they exist, \u00xx otherwise).
 fn writeJsonString(writer: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    try writer.writeByte('"');
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            0x08 => try writer.writeAll("\\b"),
-            0x09 => try writer.writeAll("\\t"),
-            0x0a => try writer.writeAll("\\n"),
-            0x0c => try writer.writeAll("\\f"),
-            0x0d => try writer.writeAll("\\r"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{ch});
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-    try writer.writeByte('"');
+    try std.json.Stringify.encodeJsonString(s, .{}, writer);
 }
 
 /// Ed25519-sign a message (raw bytes), base64 result.
@@ -592,6 +573,23 @@ test "canonicalJson sorts keys at every level without whitespace" {
     defer alloc.free(canonical);
     try std.testing.expectEqualStrings(
         "{\"a\":{\"c\":[true,\"x\"],\"d\":null},\"b\":1,\"e\":\"hi\"}",
+        canonical,
+    );
+}
+
+test "canonicalJson escapes strings the way JSON.stringify does" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"s\":\"a\\\"b\\\\c\\nd\\r\\t\\b\\f\\u0001e\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    const canonical = try canonicalJson(alloc, parsed.value);
+    defer alloc.free(canonical);
+    try std.testing.expectEqualStrings(
+        "{\"s\":\"a\\\"b\\\\c\\nd\\r\\t\\b\\f\\u0001e\"}",
         canonical,
     );
 }

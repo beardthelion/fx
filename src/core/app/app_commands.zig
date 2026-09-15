@@ -1062,11 +1062,11 @@ pub fn Handlers(comptime App: type) type {
                     defer if (comptime @hasField(App, "permission_state")) {
                         app.permission_state.authority_mutex.unlock(io_mod.getIo());
                     };
-                    for (passport_grants.mappedToolNames(target.action)) |tool_name| {
+                    for (passport_grants.mappedToolNames(target.grant.action)) |tool_name| {
                         app.permission_engine.allow(
                             app.alloc,
                             tool_name,
-                            target.scope,
+                            target.grant.scope,
                         ) catch |err| {
                             const body = try std.fmt.allocPrint(
                                 app.alloc,
@@ -1170,25 +1170,25 @@ pub fn Handlers(comptime App: type) type {
             for (pending) |g| {
                 var action_safe = try text_utils.encodeTerminalSafe(
                     app.alloc,
-                    g.action,
+                    g.grant.action,
                     128,
                 );
                 defer action_safe.deinit(app.alloc);
                 var scope_safe = try text_utils.encodeTerminalSafe(
                     app.alloc,
-                    g.scope,
+                    g.grant.scope,
                     256,
                 );
                 defer scope_safe.deinit(app.alloc);
                 var id_safe = try text_utils.encodeTerminalSafe(
                     app.alloc,
-                    g.id,
+                    g.grant.id,
                     128,
                 );
                 defer id_safe.deinit(app.alloc);
                 var by_safe = try text_utils.encodeTerminalSafe(
                     app.alloc,
-                    g.granted_by,
+                    g.grant.granted_by,
                     128,
                 );
                 defer by_safe.deinit(app.alloc);

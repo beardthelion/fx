@@ -87,8 +87,70 @@ pub const HttpTransport = struct {
         return .{ .ptr = self, .request_fn = requestImpl };
     }
 
+    /// A hung store must not block a synchronous caller (the commit
+    /// mirror runs on the write path), so every request races a deadline.
+    /// When the deadline wins the request task is cancelled; cancellation
+    /// reaches it at the next Io cancellation point. Io backends without
+    /// task concurrency run the request unbounded instead of failing it.
     fn requestImpl(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        const zio = io_mod.getIo();
+        const deadline = std.Io.Clock.Timestamp.fromNow(zio, .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(default_timeout_ms),
+        });
+
+        const Event = union(enum) {
+            response: anyerror!Response,
+            deadline: anyerror!void,
+        };
+        const Ops = struct {
+            fn runRequest(t: *HttpTransport, a: Allocator, r: Request) anyerror!Response {
+                return t.requestInner(a, r);
+            }
+            fn waitDeadline(d: std.Io.Clock.Timestamp) anyerror!void {
+                try d.wait(io_mod.getIo());
+            }
+            fn drain(a: Allocator, select: *std.Io.Select(Event)) void {
+                // The losing task may still finish with an allocated
+                // body; free it before dropping its event.
+                while (select.cancel()) |item| switch (item) {
+                    .response => |result| {
+                        if (result) |res| a.free(res.body) else |_| {}
+                    },
+                    .deadline => {},
+                };
+            }
+        };
+
+        var buffer: [2]Event = undefined;
+        var select: std.Io.Select(Event) = .init(zio, &buffer);
+        select.concurrent(.deadline, Ops.waitDeadline, .{deadline}) catch {
+            // No task concurrency on this backend: preserve the previous
+            // unbounded behavior rather than failing every request.
+            return self.requestInner(alloc, req);
+        };
+        select.concurrent(.response, Ops.runRequest, .{ self, alloc, req }) catch {
+            Ops.drain(alloc, &select);
+            return self.requestInner(alloc, req);
+        };
+        const event = select.await() catch {
+            Ops.drain(alloc, &select);
+            return error.PassportHttpFailed;
+        };
+        switch (event) {
+            .response => |result| {
+                Ops.drain(alloc, &select);
+                return result;
+            },
+            .deadline => {
+                Ops.drain(alloc, &select);
+                return error.PassportHttpFailed;
+            },
+        }
+    }
+
+    fn requestInner(self: *HttpTransport, alloc: Allocator, req: Request) anyerror!Response {
         const uri = std.Uri.parse(req.url) catch return error.PassportHttpFailed;
 
         var http_req = self.client.request(req.method, uri, .{
@@ -227,7 +289,7 @@ pub const PullResult = struct {
 
 const entry_sections = [_][]const u8{ "memory", "config", "sessions", "grants", "identity" };
 
-fn isValidSegment(seg: []const u8) bool {
+pub fn isValidSegment(seg: []const u8) bool {
     if (seg.len == 0) return false;
     if (!std.ascii.isAlphanumeric(seg[0])) return false;
     for (seg) |ch| {
@@ -238,7 +300,7 @@ fn isValidSegment(seg: []const u8) bool {
 }
 
 /// `sessions/<id>/<seq>` chunk suffix: six or more digits (PS-022).
-fn isChunkSeq(seg: []const u8) bool {
+pub fn isChunkSeq(seg: []const u8) bool {
     if (seg.len < 6) return false;
     for (seg) |ch| {
         if (!std.ascii.isDigit(ch)) return false;
@@ -246,13 +308,25 @@ fn isChunkSeq(seg: []const u8) bool {
     return true;
 }
 
+/// The lexical shape every routed path must have: no traversal, no empty
+/// or invalid segments. Shared with the redirect layer, which applies
+/// this shape without the entry-section allowlist or the 255-byte cap.
+pub fn isValidPathShape(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/' or path[path.len - 1] == '/') return false;
+    if (std.mem.find(u8, path, "..") != null) return false;
+    if (std.mem.find(u8, path, "//") != null) return false;
+    if (std.mem.findScalar(u8, path, '\\') != null) return false;
+    if (std.mem.findScalar(u8, path, 0) != null) return false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (!isValidSegment(seg)) return false;
+    }
+    return true;
+}
+
 pub fn isValidEntryKey(key: []const u8) bool {
-    if (key.len == 0 or key.len > 255) return false;
-    if (key[0] == '/' or key[key.len - 1] == '/') return false;
-    if (std.mem.find(u8, key, "..") != null) return false;
-    if (std.mem.find(u8, key, "//") != null) return false;
-    if (std.mem.findScalar(u8, key, '\\') != null) return false;
-    if (std.mem.findScalar(u8, key, 0) != null) return false;
+    if (key.len > 255 or !isValidPathShape(key)) return false;
     var it = std.mem.splitScalar(u8, key, '/');
     const section = it.next() orelse return false;
     for (entry_sections) |s| {
@@ -266,29 +340,18 @@ pub fn isValidEntryKey(key: []const u8) bool {
         if (it.next() != null) return false;
         return isValidSegment(id_seg) and isChunkSeq(seq_seg);
     }
-    var count: usize = 1;
-    while (it.next()) |seg| {
-        if (!isValidSegment(seg)) return false;
-        count += 1;
-    }
-    return count >= 2;
+    // Every remaining segment is already shape-valid; the key needs at
+    // least one segment past the section.
+    return it.next() != null;
 }
 
 /// Percent-encode one path segment per RFC 3986 unreserved set.
 fn urlEncodeSegment(alloc: Allocator, seg: []const u8) Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    for (seg) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
-            try out.append(alloc, ch);
-        } else {
-            try out.append(alloc, '%');
-            const hex = "0123456789ABCDEF";
-            try out.append(alloc, hex[ch >> 4]);
-            try out.append(alloc, hex[ch & 0xf]);
-        }
-    }
-    return out.toOwnedSlice(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const component: std.Uri.Component = .{ .raw = seg };
+    component.formatEscaped(&out.writer) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 /// `sha256:` hex over the sorted `key\thash` lines — the PUT `base`.
@@ -367,6 +430,8 @@ pub const Client = struct {
     scan_mode: secretscan.ScanMode,
     enc_key: [crypto.key_len]u8,
     namespace: []u8,
+    /// urlEncodeSegment(namespace), computed once at init.
+    encoded_namespace: []u8,
     token: ?Token = null,
     last_seq: u64,
     last_manifest_canonical: ?[]u8 = null,
@@ -384,6 +449,11 @@ pub const Client = struct {
         did: []const u8,
         /// The passport's immutable root DID. Defaults to `did`.
         genesis_did: ?[]const u8 = null,
+        /// Explicit namespace override (PS-012): pins a namespace that
+        /// differs from the genesis-DID-derived one (post-rotation
+        /// holder). The entry key is derived against this namespace.
+        /// Callers validate the shape before passing it in.
+        namespace: ?[]const u8 = null,
         /// Rotation chain to present at /auth/verify (post-rotation auth).
         attestations: []const identity.RotationAttestation = &.{},
         /// Passphrase the entry key is derived from. Never sent.
@@ -396,9 +466,14 @@ pub const Client = struct {
 
     pub fn init(alloc: Allocator, transport: Transport, opts: Options) !Client {
         const genesis_did = opts.genesis_did orelse opts.did;
-        const namespace = try identity.namespaceFor(alloc, genesis_did);
+        const namespace = if (opts.namespace) |ns|
+            try alloc.dupe(u8, ns)
+        else
+            try identity.namespaceFor(alloc, genesis_did);
         errdefer alloc.free(namespace);
         const enc_key = try crypto.deriveKey(alloc, opts.passphrase, namespace);
+        const encoded_namespace = try urlEncodeSegment(alloc, namespace);
+        errdefer alloc.free(encoded_namespace);
         var url = opts.url;
         if (url.len > 0 and url[url.len - 1] == '/') url = url[0 .. url.len - 1];
         return .{
@@ -412,6 +487,7 @@ pub const Client = struct {
             .scan_mode = opts.scan_mode,
             .enc_key = enc_key,
             .namespace = namespace,
+            .encoded_namespace = encoded_namespace,
             .last_seq = opts.last_seq,
         };
     }
@@ -422,6 +498,7 @@ pub const Client = struct {
         self.last_error.deinit(self.alloc);
         if (self.last_scan_findings) |f| secretscan.freeFindings(self.alloc, f);
         self.alloc.free(self.namespace);
+        self.alloc.free(self.encoded_namespace);
         self.* = undefined;
     }
 
@@ -471,18 +548,14 @@ pub const Client = struct {
     }
 
     fn endpointUrl(self: *Client, alloc: Allocator, suffix: []const u8) ![]u8 {
-        const encoded_ns = try urlEncodeSegment(alloc, self.namespace);
-        defer alloc.free(encoded_ns);
-        return std.fmt.allocPrint(alloc, "{s}/passport/{s}{s}", .{ self.url, encoded_ns, suffix });
+        return std.fmt.allocPrint(alloc, "{s}/passport/{s}{s}", .{ self.url, self.encoded_namespace, suffix });
     }
 
     fn entryUrl(self: *Client, alloc: Allocator, entry_key: []const u8) ![]u8 {
         var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(alloc);
-        const encoded_ns = try urlEncodeSegment(alloc, self.namespace);
-        defer alloc.free(encoded_ns);
         try encoded.appendSlice(alloc, "/passport/");
-        try encoded.appendSlice(alloc, encoded_ns);
+        try encoded.appendSlice(alloc, self.encoded_namespace);
         var it = std.mem.splitScalar(u8, entry_key, '/');
         while (it.next()) |seg| {
             const encoded_seg = try urlEncodeSegment(alloc, seg);
@@ -638,22 +711,15 @@ pub const Client = struct {
         if (parsed.value != .object) return error.PassportProtocol;
 
         var map: std.json.ObjectMap = .empty;
-        errdefer {
-            var it = map.iterator();
-            while (it.next()) |kv| {
-                alloc.free(@constCast(kv.key_ptr.*));
-                alloc.free(@constCast(kv.value_ptr.*.string));
-            }
-            map.deinit(alloc);
-        }
+        errdefer freeHashMap(alloc, &map);
         var it = parsed.value.object.iterator();
         while (it.next()) |kv| {
             if (kv.value_ptr.* != .string) return error.PassportProtocol;
-            try map.put(
-                alloc,
-                try alloc.dupe(u8, kv.key_ptr.*),
-                .{ .string = try alloc.dupe(u8, kv.value_ptr.string) },
-            );
+            const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
+            errdefer alloc.free(owned_key);
+            const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
+            errdefer alloc.free(owned_val);
+            try map.put(alloc, owned_key, .{ .string = owned_val });
         }
         return map;
     }
@@ -760,22 +826,15 @@ pub const Client = struct {
         }
 
         var entries: std.json.ObjectMap = .empty;
-        errdefer {
-            var it = entries.iterator();
-            while (it.next()) |kv| {
-                alloc.free(@constCast(kv.key_ptr.*));
-                alloc.free(@constCast(kv.value_ptr.*.string));
-            }
-            entries.deinit(alloc);
-        }
+        errdefer freeHashMap(alloc, &entries);
         var it = entries_v.object.iterator();
         while (it.next()) |kv| {
             if (kv.value_ptr.* != .string) return error.PassportIntegrity;
-            try entries.put(
-                alloc,
-                try alloc.dupe(u8, kv.key_ptr.*),
-                .{ .string = try alloc.dupe(u8, kv.value_ptr.string) },
-            );
+            const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
+            errdefer alloc.free(owned_key);
+            const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
+            errdefer alloc.free(owned_val);
+            try entries.put(alloc, owned_key, .{ .string = owned_val });
         }
 
         return .{
@@ -895,11 +954,15 @@ pub const Client = struct {
             scan_entries[i] = .{ .key = entry.key, .text = entry.plaintext };
         }
         secretscan.enforce(alloc, scan_entries, self.scan_mode, &findings) catch |err| {
-            self.last_scan_findings = findings.items;
+            // toOwnedSlice, not .items: capacity can exceed length, and a
+            // size-tracking allocator needs the exact length back on
+            // free. A failure here keeps findings owned so the defer
+            // below still frees them.
+            self.last_scan_findings = findings.toOwnedSlice(alloc) catch return err;
             findings_owned = false;
             return err;
         };
-        self.last_scan_findings = findings.items;
+        self.last_scan_findings = try findings.toOwnedSlice(alloc);
         findings_owned = false;
 
         var hashes_opt = try self.hashesView();
@@ -912,23 +975,9 @@ pub const Client = struct {
         const server_hashes: std.json.ObjectMap = if (hashes_opt) |h| h else .empty;
 
         var to_upload: std.json.ObjectMap = .empty;
-        defer {
-            var it = to_upload.iterator();
-            while (it.next()) |kv| {
-                alloc.free(@constCast(kv.key_ptr.*));
-                alloc.free(@constCast(kv.value_ptr.*.string));
-            }
-            to_upload.deinit(alloc);
-        }
+        defer freeHashMap(alloc, &to_upload);
         var next_hashes: std.json.ObjectMap = .empty;
-        defer {
-            var it = next_hashes.iterator();
-            while (it.next()) |kv| {
-                alloc.free(@constCast(kv.key_ptr.*));
-                alloc.free(@constCast(kv.value_ptr.*.string));
-            }
-            next_hashes.deinit(alloc);
-        }
+        defer freeHashMap(alloc, &next_hashes);
         var uploaded: std.ArrayList([]u8) = .empty;
         defer uploaded.deinit(alloc);
         var unchanged: std.ArrayList([]u8) = .empty;
@@ -941,11 +990,11 @@ pub const Client = struct {
         var it = server_hashes.iterator();
         while (it.next()) |kv| {
             if (std.mem.eql(u8, kv.key_ptr.*, manifest_entry_key)) continue;
-            try next_hashes.put(
-                alloc,
-                try alloc.dupe(u8, kv.key_ptr.*),
-                .{ .string = try alloc.dupe(u8, kv.value_ptr.string) },
-            );
+            const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
+            errdefer alloc.free(owned_key);
+            const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
+            errdefer alloc.free(owned_val);
+            try next_hashes.put(alloc, owned_key, .{ .string = owned_val });
         }
         for (user_deletions.items) |key| {
             if (next_hashes.fetchOrderedRemove(key)) |kv| {
@@ -970,7 +1019,9 @@ pub const Client = struct {
             if (!was_deleted) {
                 if (server_hashes.get(entry.key)) |existing| {
                     if (std.mem.eql(u8, existing.string, hash)) {
-                        try unchanged.append(alloc, try alloc.dupe(u8, entry.key));
+                        const key_copy = try alloc.dupe(u8, entry.key);
+                        errdefer alloc.free(key_copy);
+                        try unchanged.append(alloc, key_copy);
                         continue;
                     }
                 }
@@ -980,17 +1031,25 @@ pub const Client = struct {
                 alloc.free(@constCast(old.key));
                 alloc.free(@constCast(old.value.string));
             }
-            try next_hashes.put(
-                alloc,
-                try alloc.dupe(u8, entry.key),
-                .{ .string = try alloc.dupe(u8, hash) },
-            );
-            try to_upload.put(
-                alloc,
-                try alloc.dupe(u8, entry.key),
-                .{ .string = try alloc.dupe(u8, blob) },
-            );
-            try uploaded.append(alloc, try alloc.dupe(u8, entry.key));
+            {
+                const owned_key = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(owned_key);
+                const owned_val = try alloc.dupe(u8, hash);
+                errdefer alloc.free(owned_val);
+                try next_hashes.put(alloc, owned_key, .{ .string = owned_val });
+            }
+            {
+                const owned_key = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(owned_key);
+                const owned_val = try alloc.dupe(u8, blob);
+                errdefer alloc.free(owned_val);
+                try to_upload.put(alloc, owned_key, .{ .string = owned_val });
+            }
+            {
+                const key_copy = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(key_copy);
+                try uploaded.append(alloc, key_copy);
+            }
         }
 
         var changed = uploaded.items.len > 0;
@@ -1024,12 +1083,18 @@ pub const Client = struct {
             signed_manifest.plaintext,
         );
         defer alloc.free(manifest_blob);
-        try to_upload.put(
-            alloc,
-            try alloc.dupe(u8, manifest_entry_key),
-            .{ .string = try alloc.dupe(u8, manifest_blob) },
-        );
-        try uploaded.append(alloc, try alloc.dupe(u8, manifest_entry_key));
+        {
+            const owned_key = try alloc.dupe(u8, manifest_entry_key);
+            errdefer alloc.free(owned_key);
+            const owned_val = try alloc.dupe(u8, manifest_blob);
+            errdefer alloc.free(owned_val);
+            try to_upload.put(alloc, owned_key, .{ .string = owned_val });
+        }
+        {
+            const key_copy = try alloc.dupe(u8, manifest_entry_key);
+            errdefer alloc.free(key_copy);
+            try uploaded.append(alloc, key_copy);
+        }
 
         // PUT body: {base, entries, deletions?}.
         var body_map: std.json.ObjectMap = .empty;
@@ -1115,7 +1180,10 @@ pub const Client = struct {
         if (res_parsed.value.object.get("deleted")) |del_v| {
             if (del_v == .array) {
                 for (del_v.array.items) |item| {
-                    if (item == .string) try deleted.append(alloc, try alloc.dupe(u8, item.string));
+                    if (item != .string) continue;
+                    const key_copy = try alloc.dupe(u8, item.string);
+                    errdefer alloc.free(key_copy);
+                    try deleted.append(alloc, key_copy);
                 }
             }
         }
@@ -1186,16 +1254,24 @@ pub const Client = struct {
             const text = crypto.decryptEntry(alloc, &self.enc_key, entry_key, entry_v.string) catch
                 return error.PassportDecrypt;
             errdefer alloc.free(text);
+            const key_copy = try alloc.dupe(u8, entry_key);
+            errdefer alloc.free(key_copy);
             try entries.append(alloc, .{
-                .key = try alloc.dupe(u8, entry_key),
+                .key = key_copy,
                 .plaintext = text,
             });
         }
         // The manifest itself is passport state too.
-        try entries.append(alloc, .{
-            .key = try alloc.dupe(u8, manifest_entry_key),
-            .plaintext = try alloc.dupe(u8, remote.plaintext),
-        });
+        {
+            const key_copy = try alloc.dupe(u8, manifest_entry_key);
+            errdefer alloc.free(key_copy);
+            const text_copy = try alloc.dupe(u8, remote.plaintext);
+            errdefer alloc.free(text_copy);
+            try entries.append(alloc, .{
+                .key = key_copy,
+                .plaintext = text_copy,
+            });
+        }
 
         return .{
             .namespace = self.namespace,
@@ -1222,26 +1298,26 @@ pub const Client = struct {
         }
         var it = map.iterator();
         while (it.next()) |kv| {
+            const key_copy = try alloc.dupe(u8, kv.key_ptr.*);
+            errdefer alloc.free(key_copy);
+            const val_copy = try alloc.dupe(u8, kv.value_ptr.string);
+            errdefer alloc.free(val_copy);
             try out.append(alloc, .{
-                .key = try alloc.dupe(u8, kv.key_ptr.*),
-                .plaintext = try alloc.dupe(u8, kv.value_ptr.string),
+                .key = key_copy,
+                .plaintext = val_copy,
             });
         }
         return out.toOwnedSlice(alloc);
     }
 
-    /// Read and decrypt one entry, verified against the signed manifest
-    /// (PS-041). Returns null when the passport does not exist or the
-    /// manifest does not name the key.
-    pub fn readEntry(self: *Client, entry_key: []const u8) Error!?[]u8 {
-        const alloc = self.alloc;
-        var remote_opt = try self.remoteManifest();
-        defer if (remote_opt) |*r| r.deinit(alloc);
-        const remote = remote_opt orelse return null;
-        self.adoptManifest(remote);
-        const expected = remote.entries.get(entry_key) orelse return null;
-        const expected_hash = expected.string;
-
+    /// Fetch, hash-check, and decrypt one entry the verified manifest
+    /// already names. Shared by readEntry and readEntries.
+    fn readVerifiedEntry(
+        self: *Client,
+        alloc: Allocator,
+        entry_key: []const u8,
+        expected_hash: []const u8,
+    ) Error![]u8 {
         const url = try self.entryUrl(alloc, entry_key);
         defer alloc.free(url);
         const res = try self.request(.GET, url, null, false);
@@ -1262,6 +1338,42 @@ pub const Client = struct {
         if (!std.mem.eql(u8, actual_hash, expected_hash)) return error.PassportIntegrity;
         return crypto.decryptEntry(alloc, &self.enc_key, entry_key, entry_v.string) catch
             error.PassportDecrypt;
+    }
+
+    /// Read and decrypt one entry, verified against the signed manifest
+    /// (PS-041). Returns null when the passport does not exist or the
+    /// manifest does not name the key.
+    pub fn readEntry(self: *Client, entry_key: []const u8) Error!?[]u8 {
+        const alloc = self.alloc;
+        var remote_opt = try self.remoteManifest();
+        defer if (remote_opt) |*r| r.deinit(alloc);
+        const remote = remote_opt orelse return null;
+        self.adoptManifest(remote);
+        const expected = remote.entries.get(entry_key) orelse return null;
+        return try self.readVerifiedEntry(alloc, entry_key, expected.string);
+    }
+
+    /// Read several entries under one manifest fetch+verify instead of
+    /// one per entry. results[i] answers entry_keys[i]: null when the
+    /// passport does not exist or the manifest does not name the key,
+    /// the same contract as readEntry. Caller owns the slice and each
+    /// non-null element.
+    pub fn readEntries(self: *Client, alloc: Allocator, entry_keys: []const []const u8) Error![]?[]u8 {
+        const results = try alloc.alloc(?[]u8, entry_keys.len);
+        @memset(results, null);
+        errdefer {
+            for (results) |r| if (r) |b| alloc.free(b);
+            alloc.free(results);
+        }
+        var remote_opt = try self.remoteManifest();
+        defer if (remote_opt) |*r| r.deinit(alloc);
+        const remote = remote_opt orelse return results;
+        self.adoptManifest(remote);
+        for (entry_keys, 0..) |entry_key, i| {
+            const expected = remote.entries.get(entry_key) orelse continue;
+            results[i] = try self.readVerifiedEntry(alloc, entry_key, expected.string);
+        }
+        return results;
     }
 
     /// Rotate the signing key (PS-050/051): sign the attestation with the

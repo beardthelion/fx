@@ -83,21 +83,13 @@ fn sessionIdRemoteable(session_id: []const u8) bool {
     return session_id.len + 16 <= 255;
 }
 
-fn isChunkSeqText(seg: []const u8) bool {
-    if (seg.len < seq_width) return false;
-    for (seg) |ch| {
-        if (!std.ascii.isDigit(ch)) return false;
-    }
-    return true;
-}
-
 /// One mirrored file's position in the chunk space.
 const FileRecord = struct {
     name: []const u8,
     first: u64,
     chunks: u64,
     bytes: u64,
-    sha256: []const u8,
+    sha256: []u8,
 };
 
 const MirrorIndex = struct {
@@ -270,9 +262,15 @@ pub fn mirrorSession(
         const name = entry.name;
         if (!isMirroredFile(name)) continue;
         if (std.mem.eql(u8, name, events_file)) continue;
-        try names.append(alloc, try alloc.dupe(u8, name));
+        const owned_name = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned_name);
+        try names.append(alloc, owned_name);
     }
-    try names.append(alloc, try alloc.dupe(u8, events_file));
+    {
+        const owned_name = try alloc.dupe(u8, events_file);
+        errdefer alloc.free(owned_name);
+        try names.append(alloc, owned_name);
+    }
     std.mem.sort([]u8, names.items, {}, struct {
         fn lessThan(_: void, a: []u8, b: []u8) bool {
             return std.mem.lessThan(u8, a, b);
@@ -280,9 +278,24 @@ pub fn mirrorSession(
     }.lessThan);
     if (names.items.len > max_mirrored_files) return error.PassportMirrorCorrupt;
 
+    // The prior mirror index: a file whose sha256 and chunk layout match
+    // its previous record is already remote under the same seqs, so its
+    // chunks are not re-read-and-re-encrypted. A corrupt or absent index
+    // just means a full upload.
+    var prior: ?ParsedIndex = null;
+    defer if (prior) |*p| p.deinit(alloc);
+    const index_rel = try chunkRel(alloc, session_id, index_seq);
+    defer alloc.free(index_rel);
+    if (store.readSurface(alloc, index_rel) catch null) |index_bytes| {
+        defer alloc.free(index_bytes);
+        if (index_bytes.len <= max_index_bytes) {
+            prior = parseIndex(alloc, index_bytes) catch null;
+        }
+    }
+
     var records: std.ArrayList(FileRecord) = .empty;
     defer {
-        for (records.items) |r| alloc.free(@constCast(r.sha256));
+        for (records.items) |r| alloc.free(r.sha256);
         records.deinit(alloc);
     }
     var next_seq: u64 = 1;
@@ -297,28 +310,62 @@ pub fn mirrorSession(
         const digest = try identity.sha256Hex(alloc, bytes);
         defer alloc.free(digest);
         const n_chunks = chunksFor(bytes.len);
-        const sha_copy = try alloc.dupe(u8, digest);
-        errdefer alloc.free(sha_copy);
-        try records.append(alloc, .{
-            .name = name,
-            .first = next_seq,
-            .chunks = n_chunks,
-            .bytes = bytes.len,
-            .sha256 = sha_copy,
-        });
-        var seq: u64 = 0;
-        while (seq < n_chunks) : (seq += 1) {
-            const start: usize = @intCast(seq * event_chunk_bytes);
-            const end = @min(start + event_chunk_bytes, bytes.len);
-            try rel_paths.append(alloc, try chunkRel(alloc, session_id, next_seq + seq));
-            try values.append(alloc, try alloc.dupe(u8, bytes[start..end]));
+        // The records list owns sha_copy once appended; the errdefer only
+        // covers the window between dupe and append.
+        const record: FileRecord = blk: {
+            const sha_copy = try alloc.dupe(u8, digest);
+            errdefer alloc.free(sha_copy);
+            const r: FileRecord = .{
+                .name = name,
+                .first = next_seq,
+                .chunks = n_chunks,
+                .bytes = bytes.len,
+                .sha256 = sha_copy,
+            };
+            try records.append(alloc, r);
+            break :blk r;
+        };
+        const unchanged = if (prior) |*p| blk: {
+            for (p.files) |f| {
+                if (std.mem.eql(u8, f.name, record.name) and
+                    f.first == record.first and
+                    f.chunks == record.chunks and
+                    f.bytes == record.bytes and
+                    std.mem.eql(u8, f.sha256, record.sha256))
+                    break :blk true;
+            }
+            break :blk false;
+        } else false;
+        if (!unchanged) {
+            var seq: u64 = 0;
+            while (seq < n_chunks) : (seq += 1) {
+                const start: usize = @intCast(seq * event_chunk_bytes);
+                const end = @min(start + event_chunk_bytes, bytes.len);
+                {
+                    const rel = try chunkRel(alloc, session_id, next_seq + seq);
+                    errdefer alloc.free(rel);
+                    try rel_paths.append(alloc, rel);
+                }
+                {
+                    const chunk_copy = try alloc.dupe(u8, bytes[start..end]);
+                    errdefer alloc.free(chunk_copy);
+                    try values.append(alloc, chunk_copy);
+                }
+            }
         }
         next_seq += n_chunks;
     }
 
-    const index_json = try encodeIndex(alloc, .{ .files = records.items });
-    try rel_paths.append(alloc, try chunkRel(alloc, session_id, index_seq));
-    try values.append(alloc, index_json);
+    {
+        const index_json = try encodeIndex(alloc, .{ .files = records.items });
+        errdefer alloc.free(index_json);
+        try values.append(alloc, index_json);
+    }
+    {
+        const rel = try chunkRel(alloc, session_id, index_seq);
+        errdefer alloc.free(rel);
+        try rel_paths.append(alloc, rel);
+    }
 
     // Stale remote keys: chunk seqs outside the set this mirror writes.
     // Keys that do not match the chunk grammar are left alone: they were
@@ -338,7 +385,7 @@ pub fn mirrorSession(
     for (remote_keys) |key| {
         if (!std.mem.startsWith(u8, key, key_prefix)) continue;
         const seg = key[key_prefix.len..];
-        if (!isChunkSeqText(seg)) continue;
+        if (!client_mod.isChunkSeq(seg)) continue;
         const remote_seq = std.fmt.parseUnsigned(u64, seg, 10) catch continue;
         var expected = remote_seq == index_seq;
         if (!expected) {
@@ -380,7 +427,28 @@ pub fn hydrateSession(
     defer index.deinit(alloc);
 
     // Fetch every chunk before touching the filesystem so a torn mirror
-    // cannot leave a half-materialized directory.
+    // cannot leave a half-materialized directory. One batched fetch
+    // covers them all: a single manifest fetch+verify instead of one
+    // per chunk.
+    var chunk_rels: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (chunk_rels.items) |r| alloc.free(r);
+        chunk_rels.deinit(alloc);
+    }
+    for (index.files) |f| {
+        var seq: u64 = 0;
+        while (seq < f.chunks) : (seq += 1) {
+            const rel = try chunkRel(alloc, session_id, f.first + seq);
+            errdefer alloc.free(rel);
+            try chunk_rels.append(alloc, rel);
+        }
+    }
+    const chunks = try store.readSurfacesBatch(alloc, chunk_rels.items);
+    defer {
+        for (chunks) |c| if (c) |b| alloc.free(b);
+        alloc.free(chunks);
+    }
+
     const FileContent = struct {
         name: []u8,
         bytes: []u8,
@@ -390,17 +458,16 @@ pub fn hydrateSession(
         for (contents.items) |c| alloc.free(c.bytes);
         contents.deinit(alloc);
     }
+    var chunk_cursor: usize = 0;
     for (index.files) |f| {
         const buf = try alloc.alloc(u8, @intCast(f.bytes));
         errdefer alloc.free(buf);
         var written: usize = 0;
         var seq: u64 = 0;
         while (seq < f.chunks) : (seq += 1) {
-            const rel = try chunkRel(alloc, session_id, f.first + seq);
-            defer alloc.free(rel);
-            const chunk = (try store.readSurface(alloc, rel)) orelse
+            const chunk = chunks[chunk_cursor] orelse
                 return error.PassportMirrorCorrupt;
-            defer alloc.free(chunk);
+            chunk_cursor += 1;
             if (written + chunk.len > buf.len) return error.PassportMirrorCorrupt;
             @memcpy(buf[written .. written + chunk.len], chunk);
             written += chunk.len;
@@ -446,69 +513,14 @@ pub fn deleteSession(
 
 const testing = std.testing;
 
-fn testBackend() type {
-    return struct {
-        entries: std.StringHashMapUnmanaged([]u8) = .empty,
+const testBackend = store_redirect.MockBackend;
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
-            var it = self.entries.iterator();
-            while (it.next()) |kv| {
-                alloc.free(@constCast(kv.key_ptr.*));
-                alloc.free(kv.value_ptr.*);
-            }
-            self.entries.deinit(alloc);
-        }
-
-        fn backend(self: *@This()) store_redirect.Backend {
-            return .{ .ptr = self, .vtable = &vtable };
-        }
-
-        const vtable: store_redirect.Backend.VTable = .{
-            .read = readImpl,
-            .write = writeImpl,
-            .delete = deleteImpl,
-            .list = listImpl,
-        };
-
-        fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!?[]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const value = self.entries.get(key) orelse return null;
-            return try alloc.dupe(u8, value);
-        }
-
-        fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) store_redirect.BackendError!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.entries.fetchRemove(key)) |kv| {
-                alloc.free(@constCast(kv.key));
-                alloc.free(kv.value);
-            }
-            try self.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, bytes));
-        }
-
-        fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.entries.fetchRemove(key)) |kv| {
-                alloc.free(@constCast(kv.key));
-                alloc.free(kv.value);
-            }
-        }
-
-        fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) store_redirect.BackendError![][]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            var out: std.ArrayList([]u8) = .empty;
-            errdefer {
-                for (out.items) |s| alloc.free(s);
-                out.deinit(alloc);
-            }
-            var it = self.entries.iterator();
-            while (it.next()) |kv| {
-                if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
-                    try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
-                }
-            }
-            return out.toOwnedSlice(alloc);
-        }
-    };
+fn putMockEntry(mock: *testBackend, alloc: Allocator, key: []const u8, value: []const u8) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try mock.entries.put(alloc, owned_key, owned_value);
 }
 
 test "mirror then hydrate reproduces the session directory" {
@@ -518,7 +530,7 @@ test "mirror then hydrate reproduces the session directory" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    var mock = testBackend(){};
+    var mock = testBackend{};
     defer mock.deinit(alloc);
     var store = try store_redirect.Store.init(alloc, home, mock.backend());
     defer store.deinit();
@@ -585,7 +597,7 @@ test "hydrate returns false when no mirror exists" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    var mock = testBackend(){};
+    var mock = testBackend{};
     defer mock.deinit(alloc);
     var store = try store_redirect.Store.init(alloc, home, mock.backend());
     defer store.deinit();
@@ -608,7 +620,7 @@ test "hydrate rejects a torn mirror" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    var mock = testBackend(){};
+    var mock = testBackend{};
     defer mock.deinit(alloc);
     var store = try store_redirect.Store.init(alloc, home, mock.backend());
     defer store.deinit();
@@ -622,8 +634,8 @@ test "hydrate rejects a torn mirror" {
         .{digest},
     );
     defer alloc.free(index);
-    try mock.entries.put(alloc, try alloc.dupe(u8, "sessions/s1/000000"), try alloc.dupe(u8, index));
-    try mock.entries.put(alloc, try alloc.dupe(u8, "sessions/s1/000001"), try alloc.dupe(u8, "abc"));
+    try putMockEntry(&mock, alloc, "sessions/s1/000000", index);
+    try putMockEntry(&mock, alloc, "sessions/s1/000001", "abc");
 
     var home_vd = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(
         std.testing.io,
@@ -646,14 +658,14 @@ test "deleteSession removes every mirrored key" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    var mock = testBackend(){};
+    var mock = testBackend{};
     defer mock.deinit(alloc);
     var store = try store_redirect.Store.init(alloc, home, mock.backend());
     defer store.deinit();
 
-    try mock.entries.put(alloc, try alloc.dupe(u8, "sessions/d1/000000"), try alloc.dupe(u8, "{}"));
-    try mock.entries.put(alloc, try alloc.dupe(u8, "sessions/d1/000001"), try alloc.dupe(u8, "x"));
-    try mock.entries.put(alloc, try alloc.dupe(u8, "sessions/other/000000"), try alloc.dupe(u8, "{}"));
+    try putMockEntry(&mock, alloc, "sessions/d1/000000", "{}");
+    try putMockEntry(&mock, alloc, "sessions/d1/000001", "x");
+    try putMockEntry(&mock, alloc, "sessions/other/000000", "{}");
 
     try deleteSession(alloc, &store, "d1");
     try testing.expect(mock.entries.get("sessions/d1/000000") == null);

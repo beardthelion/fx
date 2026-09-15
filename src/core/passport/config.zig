@@ -39,8 +39,6 @@ const seed_file_name = "seed";
 const max_settings_bytes: usize = 64 * 1024;
 const max_secret_file_bytes: usize = 4 * 1024;
 
-pub const Source = enum { settings, env };
-
 pub const Config = struct {
     /// Passport store base URL, e.g. http://localhost:8080.
     url: []u8,
@@ -51,7 +49,6 @@ pub const Config = struct {
     /// Raw Ed25519 seed for the holder signing key, when provided.
     seed: ?[32]u8 = null,
     scan_mode: secretscan.ScanMode = .block,
-    source: Source,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         alloc.free(self.url);
@@ -64,7 +61,9 @@ pub const Config = struct {
 };
 
 fn secureFree(alloc: Allocator, bytes: []u8) void {
-    @memset(bytes, 0);
+    // secureZero, not memset: the compiler may elide a dead store into a
+    // buffer that is about to be freed.
+    std.crypto.secureZero(u8, bytes);
     alloc.free(bytes);
 }
 
@@ -186,26 +185,6 @@ pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) void {
     mut_env[dst] = null;
 }
 
-/// Remove FX_PASSPORT_* keys from a host-provided environ map (the acp/napi
-/// path installs maps rather than a raw envp). Returns the removed count.
-pub fn scrubEnvironMap(alloc: Allocator, map: *std.process.Environ.Map) usize {
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer keys.deinit(alloc);
-    var it = map.iterator();
-    while (it.next()) |kv| {
-        if (std.mem.startsWith(u8, kv.key_ptr.*, env_prefix)) {
-            keys.append(alloc, kv.key_ptr.*) catch break;
-        }
-    }
-    var removed: usize = 0;
-    for (keys.items) |key| {
-        // unsetenv before removal: orderedRemove frees the key string.
-        unsetEnvPosix(key);
-        if (map.orderedRemove(key)) removed += 1;
-    }
-    return removed;
-}
-
 // ─── Config resolution ──────────────────────────────────────────────────
 
 fn truthy(value: []const u8) bool {
@@ -305,7 +284,6 @@ fn parseSeedHex(text: []const u8) ?[32]u8 {
 /// Config.deinit.
 pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
     var enabled = false;
-    var source: Source = .settings;
     var url: ?[]u8 = null;
     var namespace: ?[]u8 = null;
     errdefer {
@@ -324,7 +302,6 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
     if (envValueFor(env_enabled)) |value| {
         if (truthy(value)) {
             enabled = true;
-            source = .env;
         } else if (falsy(value)) {
             enabled = false;
         }
@@ -334,7 +311,6 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
             if (url) |old| alloc.free(old);
             url = try alloc.dupe(u8, value);
             enabled = true;
-            source = .env;
         }
     }
     if (envValueFor(env_namespace)) |value| {
@@ -352,7 +328,7 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
 
     const final_url = url orelse return error.PassportUrlMissing;
 
-    var config: Config = .{ .url = final_url, .namespace = namespace, .source = source };
+    var config: Config = .{ .url = final_url, .namespace = namespace };
 
     if (envValueFor(env_scan)) |value| {
         if (std.ascii.eqlIgnoreCase(value, "warn")) {
@@ -379,21 +355,6 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
-
-test "scrubEnvironMap removes only FX_PASSPORT_* keys" {
-    var map = std.process.Environ.Map.init(std.testing.allocator);
-    defer map.deinit();
-    try map.put("FX_PASSPORT_URL", "http://localhost:8080");
-    try map.put("FX_PASSPORT_PASSPHRASE", "secret");
-    try map.put("FX_MODEL", "keep-me");
-    try map.put("HOME", "/home/test");
-
-    try std.testing.expectEqual(@as(usize, 2), scrubEnvironMap(std.testing.allocator, &map));
-    try std.testing.expect(map.get("FX_PASSPORT_URL") == null);
-    try std.testing.expect(map.get("FX_PASSPORT_PASSPHRASE") == null);
-    try std.testing.expectEqualStrings("keep-me", map.get("FX_MODEL").?);
-    try std.testing.expectEqualStrings("/home/test", map.get("HOME").?);
-}
 
 test "captureAndScrubRaw captures then strips FX_PASSPORT_* entries" {
     const alloc = std.testing.allocator;
@@ -532,6 +493,5 @@ test "resolve reads the settings.json passport block only" {
     var config = (try resolve(alloc, home)).?;
     defer config.deinit(alloc);
     try std.testing.expectEqualStrings("http://localhost:8080", config.url);
-    try std.testing.expect(config.source == .settings);
     try std.testing.expect(config.scan_mode == .block);
 }

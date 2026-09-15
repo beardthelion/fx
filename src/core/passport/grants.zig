@@ -5,8 +5,9 @@
 //! silently honored across harness boundaries (PS-061): an incoming grant
 //! is mapped onto fx's own tool/permission model and the holder must
 //! confirm before it takes effect. There is no automatic grant-application
-//! path — `importGrants` requires a Confirmer, and the only write path for
-//! grant records is `buildGrantRecord` (PS-062).
+//! path: the holder decides through `/permissions passport`
+//! (grant_import.zig), and the only write path for grant records is
+//! `buildGrantRecord` (PS-062).
 
 const std = @import("std");
 const identity = @import("identity.zig");
@@ -74,113 +75,6 @@ pub fn mappedToolNames(action: []const u8) []const []const u8 {
         .shell_exec => &fx_tool_names.shell_exec,
         .net_fetch => &fx_tool_names.net_fetch,
         .agent_spawn => &fx_tool_names.agent_spawn,
-    };
-}
-
-/// A grant mapped onto fx's action model, pending holder confirmation.
-/// `tool_names` borrows from the static tables; `grant` borrows from the
-/// source document.
-pub const MappedGrant = struct {
-    grant: Grant,
-    /// fx tool names the grant would cover (may be empty when the action
-    /// class is foreign to fx — such grants are reported but cannot be
-    /// confirmed into rules).
-    tool_names: []const []const u8,
-    /// The grant's scope as the pattern fx rules match against.
-    pattern: []const u8,
-};
-
-/// Holder-confirmation seam (PS-061). An interactive surface implements
-/// this to ask the holder; the default DenyAll confirmer keeps the "never
-/// silently honored" invariant when nothing is wired up.
-pub const Confirmer = struct {
-    ptr: *anyopaque,
-    confirm_fn: *const fn (ptr: *anyopaque, alloc: Allocator, grant: MappedGrant) bool,
-
-    pub fn confirm(self: Confirmer, alloc: Allocator, grant: MappedGrant) bool {
-        return self.confirm_fn(self.ptr, alloc, grant);
-    }
-
-    /// A confirmer that answers no to everything — the safe default.
-    pub fn denyAll() Confirmer {
-        return .{ .ptr = undefined, .confirm_fn = denyAllImpl };
-    }
-
-    fn denyAllImpl(_: *anyopaque, _: Allocator, _: MappedGrant) bool {
-        return false;
-    }
-};
-
-pub const ImportOutcome = struct {
-    /// Grants the holder confirmed, mapped to fx tool names. The caller
-    /// applies these as ordinary fx permission rules.
-    confirmed: []MappedGrant,
-    /// Grants skipped: unknown action class, expired, or declined.
-    skipped: []MappedGrant,
-
-    pub fn deinit(self: *ImportOutcome, alloc: Allocator) void {
-        for (self.confirmed) |*g| freeMappedGrant(alloc, g);
-        for (self.skipped) |*g| freeMappedGrant(alloc, g);
-        alloc.free(self.confirmed);
-        alloc.free(self.skipped);
-        self.* = undefined;
-    }
-};
-
-fn freeMappedGrant(alloc: Allocator, grant: *MappedGrant) void {
-    alloc.free(@constCast(grant.pattern));
-    // grant fields borrow from caller storage; only the pattern copy is ours.
-    grant.* = undefined;
-}
-
-/// Map a parsed grant onto fx's model and ask the holder to confirm.
-/// Unmapped action classes and expired grants skip without prompting.
-/// Nothing is applied implicitly.
-pub fn importGrant(
-    alloc: Allocator,
-    grant: Grant,
-    confirmer: Confirmer,
-    now_ms: i64,
-) !union(enum) { confirmed: MappedGrant, skipped: MappedGrant } {
-    const pattern = try alloc.dupe(u8, grant.scope);
-    errdefer alloc.free(pattern);
-    const mapped: MappedGrant = .{
-        .grant = grant,
-        .tool_names = mappedToolNames(grant.action),
-        .pattern = pattern,
-    };
-    if (mapped.tool_names.len == 0) return .{ .skipped = mapped };
-    if (grant.expires_at) |exp| {
-        if (isoExpired(exp, now_ms)) return .{ .skipped = mapped };
-    }
-    if (!confirmer.confirm(alloc, mapped)) return .{ .skipped = mapped };
-    return .{ .confirmed = mapped };
-}
-
-/// Import a set of grants: each is mapped and individually confirmed.
-pub fn importGrants(
-    alloc: Allocator,
-    grants: []const Grant,
-    confirmer: Confirmer,
-    now_ms: i64,
-) !ImportOutcome {
-    var confirmed: std.ArrayList(MappedGrant) = .empty;
-    var skipped: std.ArrayList(MappedGrant) = .empty;
-    errdefer {
-        for (confirmed.items) |*g| freeMappedGrant(alloc, g);
-        for (skipped.items) |*g| freeMappedGrant(alloc, g);
-        confirmed.deinit(alloc);
-        skipped.deinit(alloc);
-    }
-    for (grants) |grant| {
-        switch (try importGrant(alloc, grant, confirmer, now_ms)) {
-            .confirmed => |g| try confirmed.append(alloc, g),
-            .skipped => |g| try skipped.append(alloc, g),
-        }
-    }
-    return .{
-        .confirmed = try confirmed.toOwnedSlice(alloc),
-        .skipped = try skipped.toOwnedSlice(alloc),
     };
 }
 
@@ -318,21 +212,6 @@ fn daysFromCivil(y: i64, m: u8, d: u8) i64 {
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
-const TestConfirmer = struct {
-    answer: bool,
-    asked: usize = 0,
-
-    fn impl(ptr: *anyopaque, _: Allocator, _: MappedGrant) bool {
-        const self: *TestConfirmer = @ptrCast(@alignCast(ptr));
-        self.asked += 1;
-        return self.answer;
-    }
-
-    fn confirmer(self: *TestConfirmer) Confirmer {
-        return .{ .ptr = self, .confirm_fn = impl };
-    }
-};
-
 test "grant actions map onto fx tool names" {
     try std.testing.expectEqualSlices(
         []const u8,
@@ -363,46 +242,8 @@ test "grant actions map onto fx tool names" {
     try std.testing.expectEqual(@as(usize, 0), mappedToolNames("kernel.exec").len);
 }
 
-test "imported grants require holder confirmation and never auto-apply" {
-    const alloc = std.testing.allocator;
+test "expired grants are never presentable" {
     const grant: Grant = .{
-        .id = "g1",
-        .action = "fs.read",
-        .scope = "src/**",
-        .granted_by = "holder",
-        .granted_at = "2026-01-01T00:00:00Z",
-    };
-
-    var denying = TestConfirmer{ .answer = false };
-    var outcome = try importGrants(alloc, &.{grant}, denying.confirmer(), 0);
-    defer outcome.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), outcome.confirmed.len);
-    try std.testing.expectEqual(@as(usize, 1), outcome.skipped.len);
-    try std.testing.expectEqual(@as(usize, 1), denying.asked);
-
-    var approving = TestConfirmer{ .answer = true };
-    var outcome2 = try importGrants(alloc, &.{grant}, approving.confirmer(), 0);
-    defer outcome2.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), outcome2.confirmed.len);
-    try std.testing.expectEqualStrings("src/**", outcome2.confirmed[0].pattern);
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "read_file", "list_files" },
-        outcome2.confirmed[0].tool_names,
-    );
-}
-
-test "unknown action classes and expired grants skip without prompting" {
-    const alloc = std.testing.allocator;
-    var confirmer = TestConfirmer{ .answer = true };
-    const foreign: Grant = .{
-        .id = "g2",
-        .action = "hypervisor.admin",
-        .scope = "*",
-        .granted_by = "holder",
-        .granted_at = "2026-01-01T00:00:00Z",
-    };
-    const expired: Grant = .{
         .id = "g3",
         .action = "shell.exec",
         .scope = "make *",
@@ -411,26 +252,19 @@ test "unknown action classes and expired grants skip without prompting" {
         .expires_at = "2026-02-01T00:00:00Z",
     };
     const later_ms = parseIso8601Z("2026-03-01T00:00:00Z").?;
-    var outcome = try importGrants(alloc, &.{ foreign, expired }, confirmer.confirmer(), later_ms);
-    defer outcome.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), outcome.confirmed.len);
-    try std.testing.expectEqual(@as(usize, 2), outcome.skipped.len);
-    try std.testing.expectEqual(@as(usize, 0), confirmer.asked);
-}
-
-test "the deny-all default confirmer never honors a grant" {
-    const alloc = std.testing.allocator;
-    const grant: Grant = .{
-        .id = "g4",
+    try std.testing.expect(isExpired(grant, later_ms));
+    try std.testing.expect(!isExpired(grant, 0));
+    // An unparseable expiry counts as expired: an unchecked expiry is
+    // never honored.
+    const bad: Grant = .{
+        .id = "g5",
         .action = "shell.exec",
         .scope = "*",
         .granted_by = "holder",
         .granted_at = "2026-01-01T00:00:00Z",
+        .expires_at = "soon",
     };
-    var outcome = try importGrants(alloc, &.{grant}, Confirmer.denyAll(), 0);
-    defer outcome.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), outcome.confirmed.len);
-    try std.testing.expectEqual(@as(usize, 1), outcome.skipped.len);
+    try std.testing.expect(isExpired(bad, 0));
 }
 
 test "grant records serialize canonically and parse back" {

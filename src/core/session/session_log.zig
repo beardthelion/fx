@@ -1053,31 +1053,15 @@ pub const Root = struct {
     /// mirror into it and open-by-id misses hydrate from it.
     passport: ?*store_redirect.Store = null,
 
-    /// Opens the passport store for this home when the backend is enabled.
-    /// Misconfigured enabled state propagates: silently falling back to
-    /// local-only storage would hide writes the holder expects encrypted.
-    fn openPassportStore(alloc: Allocator, home_path: []const u8) !?*store_redirect.Store {
-        var store = try store_redirect.Store.open(alloc, home_path);
-        if (!store.passportEnabled()) {
-            store.deinit();
-            return null;
-        }
-        const ptr = try alloc.create(store_redirect.Store);
-        errdefer alloc.destroy(ptr);
-        ptr.* = store;
-        return ptr;
-    }
-
     pub fn initFromHome(
         alloc: Allocator,
         home_path: []const u8,
         mode: OpenMode,
     ) !Root {
-        const passport = try openPassportStore(alloc, home_path);
-        errdefer if (passport) |p| {
-            p.deinit();
-            alloc.destroy(p);
-        };
+        // Misconfigured enabled state propagates: silently falling back to
+        // local-only storage would hide writes the holder expects encrypted.
+        const passport = try store_redirect.openEnabled(alloc, home_path);
+        errdefer if (passport) |p| store_redirect.destroyOwned(p);
         const owned_home = try alloc.dupe(u8, home_path);
         errdefer alloc.free(owned_home);
         const zio = io_mod.getIo();
@@ -1188,10 +1172,7 @@ pub const Root = struct {
     }
 
     pub fn deinit(self: *Root, alloc: Allocator) void {
-        if (self.passport) |p| {
-            p.deinit();
-            alloc.destroy(p);
-        }
+        if (self.passport) |p| store_redirect.destroyOwned(p);
         if (self.sessions) |*dir| dir.close();
         alloc.free(self.display_root);
         alloc.free(self.home_path);
@@ -7685,68 +7666,7 @@ test "watermark decoder rejects malformed object keys and required strings" {
     );
 }
 
-const PassportTestBackend = struct {
-    entries: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    fn deinit(self: *PassportTestBackend, alloc: Allocator) void {
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            alloc.free(@constCast(kv.key_ptr.*));
-            alloc.free(kv.value_ptr.*);
-        }
-        self.entries.deinit(alloc);
-    }
-
-    fn backend(self: *PassportTestBackend) store_redirect.Backend {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: store_redirect.Backend.VTable = .{
-        .read = readImpl,
-        .write = writeImpl,
-        .delete = deleteImpl,
-        .list = listImpl,
-    };
-
-    fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!?[]u8 {
-        const self: *PassportTestBackend = @ptrCast(@alignCast(ptr));
-        const value = self.entries.get(key) orelse return null;
-        return try alloc.dupe(u8, value);
-    }
-
-    fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) store_redirect.BackendError!void {
-        const self: *PassportTestBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-        try self.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, bytes));
-    }
-
-    fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!void {
-        const self: *PassportTestBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-    }
-
-    fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) store_redirect.BackendError![][]u8 {
-        const self: *PassportTestBackend = @ptrCast(@alignCast(ptr));
-        var out: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (out.items) |s| alloc.free(s);
-            out.deinit(alloc);
-        }
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
-                try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
-            }
-        }
-        return out.toOwnedSlice(alloc);
-    }
-};
+const PassportTestBackend = store_redirect.MockBackend;
 
 test "passport hydration materializes a missing local sessions directory" {
     const alloc = std.testing.allocator;

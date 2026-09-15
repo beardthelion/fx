@@ -1,23 +1,22 @@
-//! Pending-grant import pipeline and the passport grant record path.
+//! Pending-grant listing and the passport grant record path.
 //!
-//! Read path (PS-061): `importPending` lists `grants/` entries, maps each
-//! onto fx's tool model, and requires an explicit holder decision through
-//! a Confirmer. Confirmed grants land as ordinary session grants on the
-//! permission engine; every explicit decision is journaled locally so a
-//! grant is never re-presented. Expired and unmapped grants skip without
-//! prompting and without a journal entry: no holder decision was made, so
-//! nothing is decided permanently.
+//! Read path (PS-061): `listPending` lists `grants/` entries that map onto
+//! fx's tool model and are still holder-decidable; `/permissions passport`
+//! resolves one with `findPending`, applies it to the permission engine,
+//! and journals the explicit decision with `recordDecision` so a grant is
+//! never re-presented. Expired and unmapped grants never reach the holder
+//! and produce no journal entry: no decision was made, so nothing is
+//! decided permanently.
 //!
 //! Write path (PS-062): `recordToolGrant` is the only route that writes
 //! `grants/` entries, and callers invoke it only for grants the holder
-//! confirmed. Imported grants are applied straight to the engine rather
-//! than through that path, so a confirmed import never echoes back as a
+//! confirmed. Decided grants are applied straight to the engine rather
+//! than through that path, so a confirmed decision never echoes back as a
 //! new grant record.
 
 const std = @import("std");
 const grants = @import("grants.zig");
 const io_mod = @import("../shared/io.zig");
-const permissions = @import("../permissions/permissions.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const store_redirect = @import("store_redirect.zig");
 
@@ -144,20 +143,6 @@ pub const DecisionJournal = struct {
 
 // ─── Pending-grant listing ──────────────────────────────────────────────
 
-/// A passport grant pending holder review. String fields borrow from
-/// `doc.backing`, which owns them.
-pub const PendingGrant = struct {
-    id: []const u8,
-    action: []const u8,
-    scope: []const u8,
-    granted_by: []const u8,
-    doc: grants.GrantDoc,
-
-    pub fn deinit(self: *PendingGrant, alloc: Allocator) void {
-        self.doc.deinit(alloc);
-    }
-};
-
 fn grantPresentable(grant: grants.Grant, now_ms: i64) bool {
     if (grants.mappedToolNames(grant.action).len == 0) return false;
     if (grants.isExpired(grant, now_ms)) return false;
@@ -166,13 +151,14 @@ fn grantPresentable(grant: grants.Grant, now_ms: i64) bool {
 
 /// List undecided grants under `grants/` that this harness could honor:
 /// parseable, a known action class, unexpired, and absent from the
-/// decision journal.
+/// decision journal. All grant fields live on `GrantDoc.grant`, backed by
+/// `GrantDoc.backing`; free each element with GrantDoc.deinit.
 pub fn listPending(
     alloc: Allocator,
     store: *store_redirect.Store,
     home: []const u8,
     now_ms: i64,
-) ![]PendingGrant {
+) ![]grants.GrantDoc {
     var journal = try DecisionJournal.load(alloc, home);
     defer journal.deinit(alloc);
 
@@ -182,14 +168,21 @@ pub fn listPending(
         alloc.free(keys);
     }
 
-    var out: std.ArrayList(PendingGrant) = .empty;
+    // One manifest fetch+verify covers every grant read; per-entry reads
+    // would re-fetch and re-verify the same manifest each time.
+    const results = try store.readSurfacesBatch(alloc, keys);
+    defer {
+        for (results) |r| if (r) |b| alloc.free(b);
+        alloc.free(results);
+    }
+
+    var out: std.ArrayList(grants.GrantDoc) = .empty;
     errdefer {
         for (out.items) |*g| g.deinit(alloc);
         out.deinit(alloc);
     }
-    for (keys) |key| {
-        const bytes = (try store.readSurface(alloc, key)) orelse continue;
-        defer alloc.free(bytes);
+    for (results) |bytes_opt| {
+        const bytes = bytes_opt orelse continue;
         var doc = (try grants.parseGrantDoc(alloc, bytes)) orelse continue;
         errdefer doc.deinit(alloc);
         if (journal.decided(doc.grant.id) != null) {
@@ -200,89 +193,10 @@ pub fn listPending(
             doc.deinit(alloc);
             continue;
         }
-        try out.append(alloc, .{
-            .id = doc.grant.id,
-            .action = doc.grant.action,
-            .scope = doc.grant.scope,
-            .granted_by = doc.grant.granted_by,
-            .doc = doc,
-        });
+        try out.append(alloc, doc);
     }
     return out.toOwnedSlice(alloc);
 }
-
-// ─── Import pipeline ────────────────────────────────────────────────────
-
-pub const ImportReport = struct {
-    /// Grants presented to the holder.
-    presented: usize = 0,
-    /// Confirmed and applied to the permission engine.
-    confirmed: usize = 0,
-    /// Explicitly declined by the holder.
-    denied: usize = 0,
-    /// Decided earlier, expired, unmapped, or unparseable.
-    skipped: usize = 0,
-};
-
-/// Import every undecided grant under `grants/`. Each grant is mapped and
-/// confirmed individually; confirmed grants become session-scoped
-/// permission grants on `engine`. Holder decisions are journaled.
-pub fn importPending(
-    alloc: Allocator,
-    store: *store_redirect.Store,
-    confirmer: grants.Confirmer,
-    engine: *permissions.PermissionEngine,
-    home: []const u8,
-    now_ms: i64,
-) !ImportReport {
-    var journal = try DecisionJournal.load(alloc, home);
-    defer journal.deinit(alloc);
-
-    const keys = try store.listSurface(alloc, "grants");
-    defer {
-        for (keys) |k| alloc.free(k);
-        alloc.free(keys);
-    }
-
-    var report: ImportReport = .{};
-    for (keys) |key| {
-        const bytes = (try store.readSurface(alloc, key)) orelse continue;
-        defer alloc.free(bytes);
-        var doc = (try grants.parseGrantDoc(alloc, bytes)) orelse {
-            report.skipped += 1;
-            continue;
-        };
-        defer doc.deinit(alloc);
-        if (journal.decided(doc.grant.id) != null or
-            !grantPresentable(doc.grant, now_ms))
-        {
-            report.skipped += 1;
-            continue;
-        }
-
-        report.presented += 1;
-        const pattern = try alloc.dupe(u8, doc.grant.scope);
-        defer alloc.free(pattern);
-        const mapped: grants.MappedGrant = .{
-            .grant = doc.grant,
-            .tool_names = grants.mappedToolNames(doc.grant.action),
-            .pattern = pattern,
-        };
-        if (!confirmer.confirm(alloc, mapped)) {
-            try journal.record(alloc, home, doc.grant.id, .denied);
-            report.denied += 1;
-            continue;
-        }
-        for (mapped.tool_names) |tool_name| {
-            try engine.allow(alloc, tool_name, mapped.pattern);
-        }
-        try journal.record(alloc, home, doc.grant.id, .confirmed);
-        report.confirmed += 1;
-    }
-    return report;
-}
-
-pub const DecideResult = enum { applied, denied, not_pending };
 
 /// Journal the holder's decision for a grant id without touching the
 /// permission engine. Callers applying a confirmed grant do the engine
@@ -296,44 +210,11 @@ pub fn recordDecision(alloc: Allocator, home: []const u8, id: []const u8, decisi
 
 /// Find a pending grant by id. Borrows into `pending`; the returned
 /// pointer is invalidated when the pending list is freed.
-pub fn findPending(pending: []PendingGrant, id: []const u8) ?*PendingGrant {
+pub fn findPending(pending: []grants.GrantDoc, id: []const u8) ?*grants.GrantDoc {
     for (pending) |*g| {
-        if (std.mem.eql(u8, g.id, id)) return g;
+        if (std.mem.eql(u8, g.grant.id, id)) return g;
     }
     return null;
-}
-
-/// Record the holder's decision for one pending grant (PS-061). A
-/// confirmed grant is applied straight to `engine` and never re-recorded
-/// under grants/. Returns .not_pending when no undecided grant has `id`.
-/// Callers with a shared engine should resolve the grant with
-/// listPending/findPending, mutate under their own lock, then
-/// recordDecision — this helper is for contexts where `engine` needs no
-/// external synchronization.
-pub fn decideGrant(
-    alloc: Allocator,
-    store: *store_redirect.Store,
-    engine: *permissions.PermissionEngine,
-    home: []const u8,
-    id: []const u8,
-    approve: bool,
-    now_ms: i64,
-) !DecideResult {
-    const pending = try listPending(alloc, store, home, now_ms);
-    defer {
-        for (pending) |*g| g.deinit(alloc);
-        alloc.free(pending);
-    }
-    const g = findPending(pending, id) orelse return .not_pending;
-    if (approve) {
-        for (grants.mappedToolNames(g.action)) |tool_name| {
-            try engine.allow(alloc, tool_name, g.scope);
-        }
-        try recordDecision(alloc, home, g.id, .confirmed);
-        return .applied;
-    }
-    try recordDecision(alloc, home, g.id, .denied);
-    return .denied;
 }
 
 // ─── Record path (PS-062) ───────────────────────────────────────────────
@@ -357,38 +238,27 @@ pub fn actionClassForTool(tool_name: []const u8) ?grants.ActionClass {
 }
 
 /// Serialize "YYYY-MM-DDTHH:MM:SSZ" for an epoch-millis timestamp.
+/// Negative (pre-1970) input is not representable in EpochSeconds and is
+/// unreachable here: `ms` is a wall-clock timestamp.
 pub fn formatIso8601Z(alloc: Allocator, ms: i64) ![]u8 {
-    const days = @divFloor(ms, 86400_000);
-    const rem = @mod(ms, 86400_000);
-    const civil = civilFromDays(days);
+    const epoch_secs: std.time.epoch.EpochSeconds = .{
+        .secs = @intCast(@max(0, @divFloor(ms, 1000))),
+    };
+    const year_day = epoch_secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch_secs.getDaySeconds();
     return std.fmt.allocPrint(
         alloc,
         "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
         .{
-            @as(u64, @intCast(civil.year)),
-            @as(u64, civil.month),
-            @as(u64, civil.day),
-            @as(u64, @intCast(@divFloor(rem, 3600_000))),
-            @as(u64, @intCast(@divFloor(@mod(rem, 3600_000), 60_000))),
-            @as(u64, @intCast(@divFloor(@mod(rem, 60_000), 1000))),
+            @as(u64, year_day.year),
+            @as(u64, month_day.month.numeric()),
+            @as(u64, month_day.day_index + 1),
+            @as(u64, day_secs.getHoursIntoDay()),
+            @as(u64, day_secs.getMinutesIntoHour()),
+            @as(u64, day_secs.getSecondsIntoMinute()),
         },
     );
-}
-
-const Civil = struct { year: i64, month: u8, day: u8 };
-
-/// Inverse of grants.zig's daysFromCivil (Howard Hinnant's algorithm).
-fn civilFromDays(z: i64) Civil {
-    const zz = z + 719468;
-    const era = @divFloor(zz, 146097);
-    const doe: u64 = @intCast(zz - era * 146097);
-    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
-    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const mp = (5 * doy + 2) / 153;
-    const d: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1);
-    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .year = if (m <= 2) y + 1 else y, .month = m, .day = d };
 }
 
 /// Record a holder-confirmed fx session grant into the passport. Tools
@@ -415,7 +285,7 @@ pub fn recordToolGrant(
 
     const granted_at = try formatIso8601Z(alloc, now_ms);
     defer alloc.free(granted_at);
-    const granted_by = if (store.client) |c| c.did else "fx";
+    const granted_by = store.holderDid() orelse "fx";
 
     const record = try grants.buildGrantRecord(alloc, .{
         .id = id,
@@ -436,85 +306,7 @@ pub fn recordToolGrant(
 
 const testing = std.testing;
 
-const MockBackend = struct {
-    entries: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    fn deinit(self: *MockBackend, alloc: Allocator) void {
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            alloc.free(@constCast(kv.key_ptr.*));
-            alloc.free(kv.value_ptr.*);
-        }
-        self.entries.deinit(alloc);
-    }
-
-    fn backend(self: *MockBackend) store_redirect.Backend {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: store_redirect.Backend.VTable = .{
-        .read = readImpl,
-        .write = writeImpl,
-        .delete = deleteImpl,
-        .list = listImpl,
-    };
-
-    fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!?[]u8 {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        const value = self.entries.get(key) orelse return null;
-        return try alloc.dupe(u8, value);
-    }
-
-    fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) store_redirect.BackendError!void {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-        try self.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, bytes));
-    }
-
-    fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!void {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-    }
-
-    fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) store_redirect.BackendError![][]u8 {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        var out: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (out.items) |s| alloc.free(s);
-            out.deinit(alloc);
-        }
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
-                try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
-            }
-        }
-        return out.toOwnedSlice(alloc);
-    }
-};
-
-const TestConfirmer = struct {
-    answer: bool = true,
-    asked: usize = 0,
-    only_id: ?[]const u8 = null,
-
-    fn impl(ptr: *anyopaque, _: Allocator, grant: grants.MappedGrant) bool {
-        const self: *TestConfirmer = @ptrCast(@alignCast(ptr));
-        self.asked += 1;
-        if (self.only_id) |id| return std.mem.eql(u8, grant.grant.id, id);
-        return self.answer;
-    }
-
-    fn confirmer(self: *TestConfirmer) grants.Confirmer {
-        return .{ .ptr = self, .confirm_fn = impl };
-    }
-};
+const MockBackend = store_redirect.MockBackend;
 
 fn putGrant(mock: *MockBackend, alloc: Allocator, id: []const u8, action: []const u8, scope: []const u8) !void {
     const record = try grants.buildGrantRecord(alloc, .{
@@ -527,44 +319,11 @@ fn putGrant(mock: *MockBackend, alloc: Allocator, id: []const u8, action: []cons
     defer alloc.free(record);
     const key = try std.fmt.allocPrint(alloc, "grants/{s}.json", .{id});
     defer alloc.free(key);
-    try mock.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, record));
-}
-
-test "importPending applies only confirmed grants to the engine" {
-    const alloc = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-
-    var mock = MockBackend{};
-    defer mock.deinit(alloc);
-    var store = try store_redirect.Store.init(alloc, home, mock.backend());
-    defer store.deinit();
-
-    try putGrant(&mock, alloc, "g-allow", "fs.read", "src/**");
-    try putGrant(&mock, alloc, "g-deny", "shell.exec", "*");
-    try putGrant(&mock, alloc, "g-foreign", "kernel.admin", "*");
-
-    var engine: permissions.PermissionEngine = .{};
-    defer engine.deinit(alloc);
-    var confirmer = TestConfirmer{ .only_id = "g-allow" };
-
-    const report = try importPending(alloc, &store, confirmer.confirmer(), &engine, home, 0);
-    try testing.expectEqual(@as(usize, 2), report.presented);
-    try testing.expectEqual(@as(usize, 1), report.confirmed);
-    try testing.expectEqual(@as(usize, 1), report.denied);
-    try testing.expectEqual(@as(usize, 1), report.skipped);
-    try testing.expect(engine.isAllowed("read_file", "src/**"));
-    try testing.expect(engine.isAllowed("list_files", "src/**"));
-    try testing.expect(!engine.isAllowed("run_command", "*"));
-
-    // A second import skips both decided grants without prompting.
-    var again = TestConfirmer{};
-    const report2 = try importPending(alloc, &store, again.confirmer(), &engine, home, 0);
-    try testing.expectEqual(@as(usize, 0), report2.presented);
-    try testing.expectEqual(@as(usize, 3), report2.skipped);
-    try testing.expectEqual(@as(usize, 0), again.asked);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_record = try alloc.dupe(u8, record);
+    errdefer alloc.free(owned_record);
+    try mock.entries.put(alloc, owned_key, owned_record);
 }
 
 test "recordToolGrant writes a grants/ entry for mapped tools only" {
@@ -628,5 +387,5 @@ test "listPending hides decided and unmapped grants" {
         alloc.free(pending2);
     }
     try testing.expectEqual(@as(usize, 1), pending2.len);
-    try testing.expectEqualStrings("g-two", pending2[0].id);
+    try testing.expectEqualStrings("g-two", pending2[0].grant.id);
 }

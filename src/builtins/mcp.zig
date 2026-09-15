@@ -816,12 +816,10 @@ fn openPassportStore(alloc: Allocator, path: []const u8) !?store_redirect.Store 
     const fx_dir = std.fs.path.dirname(path) orelse return null;
     if (!std.mem.eql(u8, std.fs.path.basename(fx_dir), profile_paths.root_dir_name)) return null;
     const home = std.fs.path.dirname(fx_dir) orelse return null;
-    var store = try store_redirect.Store.open(alloc, home);
-    if (!store.passportEnabled()) {
-        store.deinit();
-        return null;
-    }
-    return store;
+    const ptr = (try store_redirect.openEnabled(alloc, home)) orelse return null;
+    // The caller keeps the Store by value; only the container is freed.
+    defer alloc.destroy(ptr);
+    return ptr.*;
 }
 
 pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {

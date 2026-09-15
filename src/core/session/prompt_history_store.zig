@@ -122,27 +122,11 @@ pub const Store = struct {
     /// document routes through it instead of the local file.
     passport: ?*store_redirect.Store = null,
 
-    /// Opens the passport store for this home when the backend is enabled.
-    /// Misconfigured enabled state propagates rather than silently falling
-    /// back to a local history file.
-    fn openPassportStore(alloc: Allocator, home_path: []const u8) !?*store_redirect.Store {
-        var store = try store_redirect.Store.open(alloc, home_path);
-        if (!store.passportEnabled()) {
-            store.deinit();
-            return null;
-        }
-        const ptr = try alloc.create(store_redirect.Store);
-        errdefer alloc.destroy(ptr);
-        ptr.* = store;
-        return ptr;
-    }
-
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
-        const passport = try openPassportStore(alloc, home_path);
-        errdefer if (passport) |p| {
-            p.deinit();
-            alloc.destroy(p);
-        };
+        // Misconfigured enabled state propagates rather than silently
+        // falling back to a local history file.
+        const passport = try store_redirect.openEnabled(alloc, home_path);
+        errdefer if (passport) |p| store_redirect.destroyOwned(p);
         const zio = io_mod.getIo();
         var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
         defer home.close(zio);
@@ -171,10 +155,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
-        if (self.passport) |p| {
-            p.deinit();
-            alloc.destroy(p);
-        }
+        if (self.passport) |p| store_redirect.destroyOwned(p);
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.home_path);
         alloc.free(self.display_path);
@@ -1600,68 +1581,7 @@ test "symlinked durable home is rejected before prompt history reads or writes" 
 
 // A minimal in-memory backend standing in for the passport backend: every
 // surface is a key→bytes map.
-const RemoteHistoryBackend = struct {
-    entries: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    fn deinit(self: *RemoteHistoryBackend, alloc: Allocator) void {
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            alloc.free(@constCast(kv.key_ptr.*));
-            alloc.free(kv.value_ptr.*);
-        }
-        self.entries.deinit(alloc);
-    }
-
-    fn backend(self: *RemoteHistoryBackend) store_redirect.Backend {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: store_redirect.Backend.VTable = .{
-        .read = readImpl,
-        .write = writeImpl,
-        .delete = deleteImpl,
-        .list = listImpl,
-    };
-
-    fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!?[]u8 {
-        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
-        const value = self.entries.get(key) orelse return null;
-        return try alloc.dupe(u8, value);
-    }
-
-    fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) store_redirect.BackendError!void {
-        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-        try self.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, bytes));
-    }
-
-    fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!void {
-        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-    }
-
-    fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) store_redirect.BackendError![][]u8 {
-        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
-        var out: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (out.items) |s| alloc.free(s);
-            out.deinit(alloc);
-        }
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
-                try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
-            }
-        }
-        return out.toOwnedSlice(alloc);
-    }
-};
+const RemoteHistoryBackend = store_redirect.MockBackend;
 
 test "passport-backed history appends dedupes loads and clears remotely" {
     const alloc = std.testing.allocator;

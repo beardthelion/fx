@@ -133,7 +133,11 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
             if (std.mem.eql(u8, memory, fact_value)) return std.fmt.allocPrint(alloc, "remembered", .{});
         }
 
-        try existing.append(alloc, try alloc.dupe(u8, fact_value));
+        {
+            const fact_copy = try alloc.dupe(u8, fact_value);
+            errdefer alloc.free(fact_copy);
+            try existing.append(alloc, fact_copy);
+        }
         try saveMemories(alloc, &store, memories_path, existing.items);
         return std.fmt.allocPrint(alloc, "remembered", .{});
     }

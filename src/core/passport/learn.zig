@@ -26,12 +26,13 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const client_mod = @import("client.zig");
+const identity_mod = @import("identity.zig");
 const store_redirect = @import("store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const learnings_file = "learnings.jsonl";
-pub const provenance = "learned:fx";
+const learnings_file = "learnings.jsonl";
+const provenance = "learned:fx";
 
 const max_learnings_bytes: usize = 256 * 1024;
 const max_learnings: usize = 64;
@@ -116,9 +117,8 @@ fn flattenWhitespace(alloc: Allocator, text: []const u8) Allocator.Error![]u8 {
 }
 
 fn hex8(alloc: Allocator, bytes: []const u8) Allocator.Error![]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
+    const hex = try identity_mod.sha256Hex(alloc, bytes);
+    defer alloc.free(hex);
     return alloc.dupe(u8, hex[0..8]);
 }
 
@@ -230,6 +230,18 @@ pub fn captureSessionEnd(
     const bytes = (try readLearningsFile(alloc, session_dir)) orelse return;
     defer alloc.free(bytes);
 
+    // One manifest fetch+verify covers every per-line collision check
+    // below; without it each candidate would re-fetch the manifest.
+    var existing: std.StringHashMapUnmanaged(void) = .empty;
+    defer existing.deinit(alloc);
+    if (store.listSurface(alloc, "memory/") catch null) |listed| {
+        defer {
+            for (listed) |k| alloc.free(k);
+            alloc.free(listed);
+        }
+        for (listed) |k| try existing.put(alloc, k, {});
+    }
+
     var keys: std.ArrayList([]u8) = .empty;
     defer {
         for (keys.items) |k| alloc.free(k);
@@ -255,7 +267,7 @@ pub fn captureSessionEnd(
         }
         // Same slug, different content: disambiguate with a content hash
         // suffix so neither learning is lost.
-        if (try collides(alloc, store, rendered)) |with_suffix| {
+        if (try collides(alloc, store, rendered, &existing)) |with_suffix| {
             rendered.deinit(alloc);
             rendered = with_suffix;
         }
@@ -272,14 +284,16 @@ pub fn captureSessionEnd(
 
 /// If a remote entry already exists at `rendered.key` with different
 /// content, re-render under a hash-suffixed slug. Returns null when there
-/// is no collision or the existing entry holds the same bytes.
+/// is no collision or the existing entry holds the same bytes. `existing`
+/// is the memory/ key set fetched once by the caller.
 fn collides(
     alloc: Allocator,
     store: *store_redirect.Store,
     rendered: Rendered,
+    existing: *const std.StringHashMapUnmanaged(void),
 ) Allocator.Error!?Rendered {
-    const existing = store.readSurface(alloc, rendered.key) catch return null;
-    const prior = existing orelse return null;
+    if (!existing.contains(rendered.key)) return null;
+    const prior = (store.readSurface(alloc, rendered.key) catch return null) orelse return null;
     defer alloc.free(prior);
     if (std.mem.eql(u8, prior, rendered.content)) return null;
     const suffix = try hex8(alloc, rendered.content);
@@ -295,79 +309,7 @@ fn collides(
 
 const testing = std.testing;
 
-const MockBackend = struct {
-    entries: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    fn deinit(self: *MockBackend, alloc: Allocator) void {
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            alloc.free(@constCast(kv.key_ptr.*));
-            alloc.free(kv.value_ptr.*);
-        }
-        self.entries.deinit(alloc);
-    }
-
-    fn backend(self: *MockBackend) store_redirect.Backend {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: store_redirect.Backend.VTable = .{
-        .read = readImpl,
-        .write = writeImpl,
-        .delete = deleteImpl,
-        .list = listImpl,
-        .write_batch = writeBatchImpl,
-    };
-
-    fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!?[]u8 {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        const value = self.entries.get(key) orelse return null;
-        return try alloc.dupe(u8, value);
-    }
-
-    fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) store_redirect.BackendError!void {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-        try self.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, bytes));
-    }
-
-    fn writeBatchImpl(
-        ptr: *anyopaque,
-        alloc: Allocator,
-        ks: []const []const u8,
-        plaintexts: []const []const u8,
-    ) store_redirect.BackendError!void {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        for (ks, plaintexts) |key, bytes| try writeImpl(self, alloc, key, bytes);
-    }
-
-    fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!void {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        if (self.entries.fetchRemove(key)) |kv| {
-            alloc.free(@constCast(kv.key));
-            alloc.free(kv.value);
-        }
-    }
-
-    fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) store_redirect.BackendError![][]u8 {
-        const self: *MockBackend = @ptrCast(@alignCast(ptr));
-        var out: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (out.items) |s| alloc.free(s);
-            out.deinit(alloc);
-        }
-        var it = self.entries.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
-                try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
-            }
-        }
-        return out.toOwnedSlice(alloc);
-    }
-};
+const MockBackend = store_redirect.MockBackend;
 
 fn sessionDir(alloc: Allocator, tmp: *testing.TmpDir) !io_mod.VerifiedDir {
     _ = alloc;

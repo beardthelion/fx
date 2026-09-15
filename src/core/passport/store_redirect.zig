@@ -34,42 +34,18 @@ const Allocator = std.mem.Allocator;
 const max_surface_bytes: usize = 64 * 1024 * 1024;
 
 /// Where a profile-relative path's bytes live.
-pub const Route = union(enum) {
+const Route = union(enum) {
     /// Stays on the filesystem under ~/.fx.
     local,
     /// A passport entry key (owned by the caller's allocator).
     passport: []u8,
 };
 
-fn isValidSegment(seg: []const u8) bool {
-    if (seg.len == 0) return false;
-    if (!std.ascii.isAlphanumeric(seg[0])) return false;
-    for (seg) |ch| {
-        if (!std.ascii.isAlphanumeric(ch) and ch != '.' and ch != '_' and ch != '-')
-            return false;
-    }
-    return true;
-}
-
-fn segmentsValid(path: []const u8) bool {
-    if (path.len == 0) return false;
-    if (path[0] == '/' or path[path.len - 1] == '/') return false;
-    if (std.mem.find(u8, path, "..") != null) return false;
-    if (std.mem.find(u8, path, "//") != null) return false;
-    if (std.mem.findScalar(u8, path, '\\') != null) return false;
-    if (std.mem.findScalar(u8, path, 0) != null) return false;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |seg| {
-        if (!isValidSegment(seg)) return false;
-    }
-    return true;
-}
-
 /// Map a profile-relative path (forward slashes, relative to ~/.fx) to its
 /// storage route. Unroutable or unlisted paths stay local — a surface that
 /// cannot map to a valid entry key is never silently pushed into the
 /// passport.
-pub fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
+fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
     if (std.mem.eql(u8, rel_path, "settings.json"))
         return .{ .passport = try alloc.dupe(u8, "config/settings.json") };
     if (std.mem.eql(u8, rel_path, "memories.json"))
@@ -101,25 +77,6 @@ pub fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
     return .local;
 }
 
-/// Inverse of routePath for the local backend: an entry key back to the
-/// profile-relative path it shadows. Only the canonical fixed mappings and
-/// the pass-through prefixes are accepted.
-fn entryToRelPath(alloc: Allocator, entry_key: []const u8) ![]u8 {
-    if (std.mem.eql(u8, entry_key, "config/settings.json"))
-        return alloc.dupe(u8, "settings.json");
-    if (std.mem.eql(u8, entry_key, "memory/memories.json"))
-        return alloc.dupe(u8, "memories.json");
-    if (std.mem.eql(u8, entry_key, "config/history.jsonl"))
-        return alloc.dupe(u8, "history.jsonl");
-    if (std.mem.eql(u8, entry_key, "config/mcp.json"))
-        return alloc.dupe(u8, "mcp.json");
-    for ([_][]const u8{ "sessions/", "grants/", "memory/" }) |prefix| {
-        if (std.mem.startsWith(u8, entry_key, prefix) and segmentsValid(entry_key))
-            return alloc.dupe(u8, entry_key);
-    }
-    return error.InvalidEntryKey;
-}
-
 // ─── Backend interface ──────────────────────────────────────────────────
 
 pub const BackendError = error{
@@ -128,9 +85,10 @@ pub const BackendError = error{
     OutOfMemory,
 } || client_mod.Error;
 
-/// The narrow interface the stores call. Implementations: LocalBackend
-/// (filesystem) and PassportBackend (encrypted remote). Tests substitute
-/// their own.
+/// The narrow interface the stores call. The production implementation
+/// is PassportBackend (encrypted remote); the disabled path uses the
+/// localRead/localWrite/localDelete free functions directly. Tests
+/// substitute their own.
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -145,6 +103,15 @@ pub const Backend = struct {
         /// Entry keys under a prefix ("memory/", "sessions/"). Caller owns
         /// the slice and its strings.
         list: *const fn (ptr: *anyopaque, alloc: Allocator, prefix: []const u8) BackendError![][]u8,
+        /// Optional batched read: results[i] answers keys[i], null when
+        /// absent. Caller owns the slice and each non-null element. When
+        /// null the Store falls back to per-entry reads. The passport
+        /// backend verifies the manifest once for the whole batch.
+        read_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            keys: []const []const u8,
+        ) BackendError![]?[]u8 = null,
         /// Optional batched write: keys[i] receives plaintexts[i]. When null
         /// the Store falls back to per-entry writes. The passport backend
         /// uses one manifest transaction for the whole batch.
@@ -174,6 +141,21 @@ pub const Backend = struct {
     pub fn list(self: Backend, alloc: Allocator, prefix: []const u8) BackendError![][]u8 {
         return self.vtable.list(self.ptr, alloc, prefix);
     }
+    /// Batched read: results[i] answers keys[i], null when absent.
+    /// Caller owns the slice and each non-null element.
+    pub fn readBatch(self: Backend, alloc: Allocator, keys: []const []const u8) BackendError![]?[]u8 {
+        if (self.vtable.read_batch) |rb| return rb(self.ptr, alloc, keys);
+        const results = try alloc.alloc(?[]u8, keys.len);
+        @memset(results, null);
+        errdefer {
+            for (results) |r| if (r) |b| alloc.free(b);
+            alloc.free(results);
+        }
+        for (keys, 0..) |key, i| {
+            results[i] = try self.vtable.read(self.ptr, alloc, key);
+        }
+        return results;
+    }
     pub fn writeBatch(
         self: Backend,
         alloc: Allocator,
@@ -190,72 +172,9 @@ pub const Backend = struct {
     }
 };
 
-/// Local filesystem backend: entry keys map back to ~/.fx paths through
-/// entryToRelPath and use the same IO helpers the stores use today.
-pub const LocalBackend = struct {
-    /// The home directory (parent of .fx), borrowed.
-    home: []const u8,
-
-    pub fn backend(self: *LocalBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: Backend.VTable = .{
-        .read = readImpl,
-        .write = writeImpl,
-        .delete = deleteImpl,
-        .list = listImpl,
-    };
-
-    fn localPath(self: *LocalBackend, alloc: Allocator, key: []const u8) ![]u8 {
-        const rel = try entryToRelPath(alloc, key);
-        defer alloc.free(rel);
-        return std.fs.path.join(alloc, &.{ self.home, profile_paths.root_dir_name, rel });
-    }
-
-    fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!?[]u8 {
-        const self: *LocalBackend = @ptrCast(@alignCast(ptr));
-        const path = self.localPath(alloc, key) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidEntryKey,
-        };
-        defer alloc.free(path);
-        return localRead(alloc, path);
-    }
-
-    fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
-        const self: *LocalBackend = @ptrCast(@alignCast(ptr));
-        const path = self.localPath(alloc, key) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidEntryKey,
-        };
-        defer alloc.free(path);
-        try localWrite(alloc, path, bytes);
-    }
-
-    fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!void {
-        const self: *LocalBackend = @ptrCast(@alignCast(ptr));
-        const path = self.localPath(alloc, key) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidEntryKey,
-        };
-        defer alloc.free(path);
-        localDelete(path) catch return error.PassportUnavailable;
-    }
-
-    fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) BackendError![][]u8 {
-        const self: *LocalBackend = @ptrCast(@alignCast(ptr));
-        const dir_rel = std.mem.trimEnd(u8, prefix, "/");
-        if (dir_rel.len == 0 or !segmentsValid(dir_rel)) return error.InvalidEntryKey;
-        const dir_path = try std.fs.path.join(alloc, &.{ self.home, profile_paths.root_dir_name, dir_rel });
-        defer alloc.free(dir_path);
-        return localList(alloc, dir_rel, dir_path);
-    }
-};
-
-// Local fs primitives shared by the disabled path and LocalBackend. These
-// mirror what the existing stores do today: bounded read, mkdir -p plus
-// atomic write, delete ignoring FileNotFound.
+// Local fs primitives for the disabled path. These mirror what the
+// existing stores do today: bounded read, mkdir -p plus atomic write,
+// delete ignoring FileNotFound.
 
 fn localRead(alloc: Allocator, path: []const u8) BackendError!?[]u8 {
     var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
@@ -328,6 +247,7 @@ pub const PassportBackend = struct {
         .write = writeImpl,
         .delete = deleteImpl,
         .list = listImpl,
+        .read_batch = readBatchImpl,
         .write_batch = writeBatchImpl,
         .delete_batch = deleteBatchImpl,
     };
@@ -339,6 +259,12 @@ pub const PassportBackend = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => |e| return e,
         };
+    }
+
+    /// One manifest fetch+verify covers the whole batch (PS-041).
+    fn readBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError![]?[]u8 {
+        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        return self.client.readEntries(alloc, keys);
     }
 
     fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
@@ -381,7 +307,9 @@ pub const PassportBackend = struct {
         }
         for (entries) |e| {
             if (std.mem.startsWith(u8, e.key, prefix)) {
-                try out.append(alloc, try alloc.dupe(u8, e.key));
+                const owned = try alloc.dupe(u8, e.key);
+                errdefer alloc.free(owned);
+                try out.append(alloc, owned);
             }
         }
         return out.toOwnedSlice(alloc);
@@ -435,7 +363,6 @@ pub const Store = struct {
     identity: ?identity.Identity = null,
     passport_backend: ?PassportBackend = null,
     injected_backend: ?Backend = null,
-    local_backend: LocalBackend,
 
     /// Open the store for a home dir. Disabled (no config) yields a store
     /// whose every operation is plain local filesystem IO.
@@ -443,7 +370,6 @@ pub const Store = struct {
         var store = Store{
             .alloc = alloc,
             .home = try alloc.dupe(u8, home),
-            .local_backend = .{ .home = home },
         };
         errdefer alloc.free(store.home);
 
@@ -454,6 +380,13 @@ pub const Store = struct {
             const passphrase = cfg.passphrase orelse return error.PassportSecretsMissing;
             var id = try identity.identityFromSeed(alloc, seed);
             errdefer id.deinit(alloc);
+
+            if (cfg.namespace) |ns| {
+                // An explicit namespace pins a genesis DID that differs
+                // from the signing key's own DID (post-rotation holder).
+                // It must still be a valid encoded namespace (PS-012).
+                if (!identity.isValidNamespace(ns)) return error.PassportNamespaceInvalid;
+            }
 
             store.http = try alloc.create(client_mod.HttpTransport);
             errdefer alloc.destroy(store.http.?);
@@ -469,6 +402,9 @@ pub const Store = struct {
                     .key_pair = id.key_pair,
                     .did = id.did,
                     .genesis_did = id.did,
+                    // The override rides into init so the entry key is
+                    // derived once, against the effective namespace.
+                    .namespace = cfg.namespace,
                     .passphrase = passphrase,
                     .scan_mode = cfg.scan_mode,
                 },
@@ -476,20 +412,6 @@ pub const Store = struct {
             errdefer store.client.?.deinit();
             store.identity = id;
 
-            if (cfg.namespace) |ns| {
-                // An explicit namespace pins a genesis DID that differs from
-                // the signing key's own DID (post-rotation holder). It must
-                // still be a valid encoded namespace (PS-012).
-                if (!identity.isValidNamespace(ns)) return error.PassportNamespaceInvalid;
-                alloc.free(store.client.?.namespace);
-                store.client.?.namespace = try alloc.dupe(u8, ns);
-                // Re-derive the encryption key against the real namespace.
-                store.client.?.enc_key = try @import("crypto.zig").deriveKey(
-                    alloc,
-                    passphrase,
-                    ns,
-                );
-            }
             store.passport_backend = .{ .client = store.client.? };
         }
         return store;
@@ -501,7 +423,6 @@ pub const Store = struct {
             .alloc = alloc,
             .home = try alloc.dupe(u8, home),
             .injected_backend = backend,
-            .local_backend = .{ .home = home },
         };
     }
 
@@ -526,6 +447,13 @@ pub const Store = struct {
         return self.passport_backend != null;
     }
 
+    /// The holder DID the passport client signs with, when the remote
+    /// backend is live. Null on a local or injected-backend store.
+    pub fn holderDid(self: *const Store) ?[]const u8 {
+        const client = self.client orelse return null;
+        return client.did;
+    }
+
     fn activeBackend(self: *Store) ?Backend {
         if (self.injected_backend) |b| return b;
         if (self.passport_backend) |*b| return b.backend();
@@ -548,6 +476,65 @@ pub const Store = struct {
         const path = try std.fs.path.join(alloc, &.{ self.home, profile_paths.root_dir_name, rel_path });
         defer alloc.free(path);
         return localRead(alloc, path);
+    }
+
+    /// Batched read: results[i] answers rel_paths[i]. Local-routed paths
+    /// keep the per-path file reads; passport-routed paths share one
+    /// backend batch, which means one manifest fetch+verify. Caller owns
+    /// the slice and each non-null element.
+    pub fn readSurfacesBatch(
+        self: *Store,
+        alloc: Allocator,
+        rel_paths: []const []const u8,
+    ) BackendError![]?[]u8 {
+        const results = try alloc.alloc(?[]u8, rel_paths.len);
+        @memset(results, null);
+        errdefer {
+            for (results) |r| if (r) |b| alloc.free(b);
+            alloc.free(results);
+        }
+        const backend = self.activeBackend() orelse {
+            for (rel_paths, 0..) |rel_path, i| {
+                const path = try std.fs.path.join(
+                    alloc,
+                    &.{ self.home, profile_paths.root_dir_name, rel_path },
+                );
+                defer alloc.free(path);
+                results[i] = try localRead(alloc, path);
+            }
+            return results;
+        };
+        var remote_idx: std.ArrayList(usize) = .empty;
+        defer remote_idx.deinit(alloc);
+        var remote_keys: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (remote_keys.items) |k| alloc.free(k);
+            remote_keys.deinit(alloc);
+        }
+        for (rel_paths, 0..) |rel_path, i| {
+            const route = try routePath(alloc, rel_path);
+            switch (route) {
+                .local => {
+                    const path = try std.fs.path.join(
+                        alloc,
+                        &.{ self.home, profile_paths.root_dir_name, rel_path },
+                    );
+                    defer alloc.free(path);
+                    results[i] = try localRead(alloc, path);
+                },
+                .passport => |key| {
+                    try remote_keys.append(alloc, key);
+                    try remote_idx.append(alloc, i);
+                },
+            }
+        }
+        if (remote_keys.items.len == 0) return results;
+        const remote_results = try backend.readBatch(alloc, remote_keys.items);
+        // Move the elements into results; remote_results' slice is the
+        // only thing left to free.
+        defer alloc.free(remote_results);
+        for (remote_idx.items, 0..) |i, j| results[i] = remote_results[j];
+        return results;
     }
 
     /// Write a surface's bytes. Local backend uses the same
@@ -682,7 +669,7 @@ pub const Store = struct {
 /// the directory is a passport surface at all. Caller frees the result.
 fn routePrefix(alloc: Allocator, rel_prefix: []const u8) Allocator.Error!?[]u8 {
     const trimmed = std.mem.trimEnd(u8, rel_prefix, "/");
-    if (trimmed.len == 0 or !segmentsValid(trimmed)) return null;
+    if (trimmed.len == 0 or !client_mod.isValidPathShape(trimmed)) return null;
     const routed = std.mem.eql(u8, trimmed, "sessions") or
         std.mem.eql(u8, trimmed, "grants") or
         std.mem.eql(u8, trimmed, "memory") or
@@ -700,15 +687,53 @@ fn routePrefix(alloc: Allocator, rel_prefix: []const u8) Allocator.Error!?[]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/", .{trimmed});
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────
+// ─── Store-opening seam for the store wrappers ──────────────────────────
 
-const MockBackend = struct {
+/// Open a passport-enabled Store for a home dir, heap-allocated for the
+/// store wrappers that hold it behind an optional pointer. Returns null
+/// when the backend is disabled; a misconfigured enabled state (missing
+/// secrets, bad namespace) propagates rather than silently falling back
+/// to local files. destroyOwned frees the store and its memory.
+pub fn openEnabled(alloc: Allocator, home: []const u8) !?*Store {
+    const store = try alloc.create(Store);
+    errdefer alloc.destroy(store);
+    store.* = try Store.open(alloc, home);
+    if (!store.passportEnabled()) {
+        store.deinit();
+        alloc.destroy(store);
+        return null;
+    }
+    return store;
+}
+
+/// Deinit and free a Store obtained from openEnabled.
+pub fn destroyOwned(store: *Store) void {
+    const alloc = store.alloc;
+    store.deinit();
+    alloc.destroy(store);
+}
+
+/// Derive the home dir from a ~/.fx path ("<home>/.fx[/...]"). Returns
+/// null when the path does not end at the profile root dir name.
+pub fn homeFromFxPath(fx_path: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, fx_path, "/");
+    if (!std.mem.endsWith(u8, trimmed, profile_paths.root_dir_name)) return null;
+    const home = trimmed[0 .. trimmed.len - profile_paths.root_dir_name.len];
+    return std.mem.trimEnd(u8, home, "/");
+}
+
+// ─── Test seam ──────────────────────────────────────────────────────────
+
+/// In-memory backend shared by the passport unit tests. Counts each vtable
+/// call so tests can pin batching behavior.
+pub const MockBackend = struct {
     entries: std.StringHashMapUnmanaged([]u8) = .empty,
     reads: usize = 0,
+    batch_reads: usize = 0,
     writes: usize = 0,
     deletes: usize = 0,
 
-    fn deinit(self: *MockBackend, alloc: Allocator) void {
+    pub fn deinit(self: *MockBackend, alloc: Allocator) void {
         var it = self.entries.iterator();
         while (it.next()) |kv| {
             alloc.free(@constCast(kv.key_ptr.*));
@@ -717,7 +742,7 @@ const MockBackend = struct {
         self.entries.deinit(alloc);
     }
 
-    fn backend(self: *MockBackend) Backend {
+    pub fn backend(self: *MockBackend) Backend {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -726,6 +751,7 @@ const MockBackend = struct {
         .write = writeImpl,
         .delete = deleteImpl,
         .list = listImpl,
+        .read_batch = readBatchImpl,
     };
 
     fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!?[]u8 {
@@ -733,6 +759,22 @@ const MockBackend = struct {
         self.reads += 1;
         const value = self.entries.get(key) orelse return null;
         return try alloc.dupe(u8, value);
+    }
+
+    fn readBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError![]?[]u8 {
+        const self: *MockBackend = @ptrCast(@alignCast(ptr));
+        self.batch_reads += 1;
+        const results = try alloc.alloc(?[]u8, keys.len);
+        @memset(results, null);
+        errdefer {
+            for (results) |r| if (r) |b| alloc.free(b);
+            alloc.free(results);
+        }
+        for (keys, 0..) |key, i| {
+            const value = self.entries.get(key) orelse continue;
+            results[i] = try alloc.dupe(u8, value);
+        }
+        return results;
     }
 
     fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
@@ -760,16 +802,23 @@ const MockBackend = struct {
     fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) BackendError![][]u8 {
         const self: *MockBackend = @ptrCast(@alignCast(ptr));
         var out: std.ArrayList([]u8) = .empty;
-        errdefer out.deinit(alloc);
+        errdefer {
+            for (out.items) |s| alloc.free(s);
+            out.deinit(alloc);
+        }
         var it = self.entries.iterator();
         while (it.next()) |kv| {
             if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
-                try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
+                const owned = try alloc.dupe(u8, kv.key_ptr.*);
+                errdefer alloc.free(owned);
+                try out.append(alloc, owned);
             }
         }
         return out.toOwnedSlice(alloc);
     }
 };
+
+// ─── Tests ──────────────────────────────────────────────────────────────
 
 test "routePath maps the enumerated surfaces and nothing else" {
     const alloc = std.testing.allocator;
