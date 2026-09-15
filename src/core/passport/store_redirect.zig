@@ -8,6 +8,7 @@
 //!   sessions/<...>         -> sessions/<...>
 //!   grants/<...>           -> grants/<...>   (recorded permission grants)
 //!   memories.json          -> memory/memories.json
+//!   memory/<type>/<slug>.md -> memory/<...>  (learned entries, PS-120/KTD8)
 //!   history.jsonl          -> config/history.jsonl
 //!   mcp.json               -> config/mcp.json
 //!
@@ -92,6 +93,11 @@ pub fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
         if (!client_mod.isValidEntryKey(rel_path)) return .local;
         return .{ .passport = try alloc.dupe(u8, rel_path) };
     }
+    if (std.mem.startsWith(u8, rel_path, "memory/")) {
+        // Learned entries live under memory/<type>/<slug>.md (KTD8).
+        if (!client_mod.isValidEntryKey(rel_path)) return .local;
+        return .{ .passport = try alloc.dupe(u8, rel_path) };
+    }
     return .local;
 }
 
@@ -107,7 +113,7 @@ fn entryToRelPath(alloc: Allocator, entry_key: []const u8) ![]u8 {
         return alloc.dupe(u8, "history.jsonl");
     if (std.mem.eql(u8, entry_key, "config/mcp.json"))
         return alloc.dupe(u8, "mcp.json");
-    for ([_][]const u8{ "sessions/", "grants/" }) |prefix| {
+    for ([_][]const u8{ "sessions/", "grants/", "memory/" }) |prefix| {
         if (std.mem.startsWith(u8, entry_key, prefix) and segmentsValid(entry_key))
             return alloc.dupe(u8, entry_key);
     }
@@ -679,8 +685,10 @@ fn routePrefix(alloc: Allocator, rel_prefix: []const u8) Allocator.Error!?[]u8 {
     if (trimmed.len == 0 or !segmentsValid(trimmed)) return null;
     const routed = std.mem.eql(u8, trimmed, "sessions") or
         std.mem.eql(u8, trimmed, "grants") or
+        std.mem.eql(u8, trimmed, "memory") or
         std.mem.startsWith(u8, trimmed, "sessions/") or
-        std.mem.startsWith(u8, trimmed, "grants/");
+        std.mem.startsWith(u8, trimmed, "grants/") or
+        std.mem.startsWith(u8, trimmed, "memory/");
     if (!routed) return null;
     // sessions/latest/ stays local, matching routePath.
     if (std.mem.startsWith(u8, trimmed, "sessions/")) {
@@ -773,6 +781,7 @@ test "routePath maps the enumerated surfaces and nothing else" {
         .{ .path = "mcp.json", .key = "config/mcp.json" },
         .{ .path = "sessions/abc/000001", .key = "sessions/abc/000001" },
         .{ .path = "grants/grant-1.json", .key = "grants/grant-1.json" },
+        .{ .path = "memory/user/prefers-pnpm.md", .key = "memory/user/prefers-pnpm.md" },
     };
     for (cases) |case| {
         const route = try routePath(alloc, case.path);
@@ -801,6 +810,8 @@ test "routePath maps the enumerated surfaces and nothing else" {
         "grants/../escape",
         "grants/bad segment/x",
         "grants/",
+        "memory/../escape",
+        "memory/bad segment/x",
         "settings.lock",
     };
     for (local_cases) |path| {

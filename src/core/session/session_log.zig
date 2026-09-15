@@ -16,6 +16,7 @@ const session_resume_view = @import("session_resume_view.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_sync = @import("../passport/session_sync.zig");
+const passport_learn = @import("../passport/learn.zig");
 const store_redirect = @import("../passport/store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
@@ -565,6 +566,20 @@ pub const LoadedWritableSession = struct {
     external_root_user_evidence_complete: bool = false,
 
     pub fn deinit(self: *LoadedWritableSession, alloc: Allocator) void {
+        // Session end is the learning-capture seam (suite U7): land any
+        // learnings the session recorded through the same Store the
+        // commit mirror writes through. Best-effort like the mirror — a
+        // capture failure is traced, never propagated, and the local
+        // session teardown proceeds regardless.
+        if (self.passport) |store| {
+            passport_learn.captureSessionEnd(alloc, store, &self.log.dir) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=passport_learn_failed session={s} err={s}",
+                    .{ self.active_id, @errorName(err) },
+                );
+            };
+        }
         if (self.degraded_tail) |*tail| tail.deinit(alloc);
         if (self.commit_lifecycle) |*lifecycle| lifecycle.deinit(alloc);
         if (self.child_capability) |capability| {

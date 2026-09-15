@@ -4101,6 +4101,7 @@ test {
     _ = @import("core/passport/grants.zig");
     _ = @import("core/passport/grant_import.zig");
     _ = @import("core/passport/session_sync.zig");
+    _ = @import("core/passport/learn.zig");
     _ = @import("core/passport/store_redirect.zig");
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");

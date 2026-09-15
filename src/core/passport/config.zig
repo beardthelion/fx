@@ -22,6 +22,7 @@ const secretscan = @import("secretscan.zig");
 const Allocator = std.mem.Allocator;
 
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 pub const env_prefix = "FX_PASSPORT_";
 pub const env_enabled = "FX_PASSPORT_ENABLED";
@@ -135,18 +136,44 @@ pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) void {
 
     var map: std.StringHashMapUnmanaged([]const u8) = captured orelse .empty;
 
-    // Pass 1: capture names and values.
+    // Pass 1: capture names and values. raw_env aliases libc environ, and
+    // unsetenv compacts that array in place — calling it here would shift
+    // the entries not yet visited, silently skipping the variable that
+    // slid into the current slot. Nothing may mutate the array while this
+    // loop walks it.
     var i: usize = 0;
     while (raw_env[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (!isPassportEnvEntry(entry)) continue;
-        map.put(alloc, alloc.dupe(u8, envKey(entry)) catch continue, alloc.dupe(u8, envValue(entry)) catch continue) catch continue;
-        unsetEnvPosix(envKey(entry));
+        const key = alloc.dupe(u8, envKey(entry)) catch continue;
+        const value = alloc.dupe(u8, envValue(entry)) catch {
+            alloc.free(key);
+            continue;
+        };
+        const gop = map.getOrPut(alloc, key) catch {
+            alloc.free(key);
+            alloc.free(value);
+            continue;
+        };
+        if (gop.found_existing) {
+            // Repeat capture of the same name (a second entry point calling
+            // in): keep the stored key, refresh the value.
+            alloc.free(key);
+            alloc.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = value;
     }
     captured = map;
 
-    // Pass 2: compact the array in place. The envp pointer array is
-    // process-writable memory (libc rewrites it on setenv), so this is safe.
+    // Pass 2: tell libc to drop its bookkeeping for each captured key. The
+    // walk above is finished, so environ compaction is safe now. This is a
+    // no-op on non-libc builds.
+    var it = map.iterator();
+    while (it.next()) |kv| unsetEnvPosix(kv.key_ptr.*);
+
+    // Pass 3: compact the array in place. The envp pointer array is
+    // process-writable memory (libc rewrites it on setenv), so this is
+    // safe; it also covers the non-libc build where pass 2 did nothing.
     const mut_env: [*:null]?[*:0]const u8 = @ptrCast(@constCast(raw_env));
     var dst: usize = 0;
     var src: usize = 0;
@@ -161,13 +188,13 @@ pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) void {
 
 /// Remove FX_PASSPORT_* keys from a host-provided environ map (the acp/napi
 /// path installs maps rather than a raw envp). Returns the removed count.
-pub fn scrubEnvironMap(map: *std.process.Environ.Map) usize {
+pub fn scrubEnvironMap(alloc: Allocator, map: *std.process.Environ.Map) usize {
     var keys: std.ArrayList([]const u8) = .empty;
-    defer keys.deinit(std.heap.c_allocator);
+    defer keys.deinit(alloc);
     var it = map.iterator();
     while (it.next()) |kv| {
         if (std.mem.startsWith(u8, kv.key_ptr.*, env_prefix)) {
-            keys.append(std.heap.c_allocator, kv.key_ptr.*) catch break;
+            keys.append(alloc, kv.key_ptr.*) catch break;
         }
     }
     var removed: usize = 0;
@@ -361,7 +388,7 @@ test "scrubEnvironMap removes only FX_PASSPORT_* keys" {
     try map.put("FX_MODEL", "keep-me");
     try map.put("HOME", "/home/test");
 
-    try std.testing.expectEqual(@as(usize, 2), scrubEnvironMap(&map));
+    try std.testing.expectEqual(@as(usize, 2), scrubEnvironMap(std.testing.allocator, &map));
     try std.testing.expect(map.get("FX_PASSPORT_URL") == null);
     try std.testing.expect(map.get("FX_PASSPORT_PASSPHRASE") == null);
     try std.testing.expectEqualStrings("keep-me", map.get("FX_MODEL").?);
@@ -408,6 +435,75 @@ test "captureAndScrubRaw captures then strips FX_PASSPORT_* entries" {
         try std.testing.expect(!std.mem.startsWith(u8, entry, env_prefix));
     }
     try std.testing.expectEqual(@as(usize, 2), remaining);
+}
+
+test "captureAndScrubRaw captures every adjacent FX_PASSPORT_* var from the real environ" {
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    // Production hands main's c_envp to captureAndScrubRaw, and c_envp
+    // aliases libc environ — the array unsetenv mutates. A synthetic buffer
+    // cannot see that, so this test installs real environ entries.
+    const names = [_][:0]const u8{
+        "FX_PASSPORT_U7_ALPHA",
+        "FX_PASSPORT_U7_BETA",
+        "FX_PASSPORT_U7_GAMMA",
+    };
+    const values = [_][:0]const u8{ "u7-alpha", "u7-beta", "u7-gamma" };
+
+    // Isolate the assertion set: drop any ambient FX_PASSPORT_* vars.
+    // Collect-then-remove — the same rule the fix follows, because environ
+    // shifts under unsetenv while it is being walked.
+    while (true) {
+        var hit: ?[]const u8 = null;
+        var scan: usize = 0;
+        while (std.c.environ[scan]) |entry_z| : (scan += 1) {
+            const entry = std.mem.sliceTo(entry_z, 0);
+            if (isPassportEnvEntry(entry)) {
+                hit = envKey(entry);
+                break;
+            }
+        }
+        unsetEnvPosix(hit orelse break);
+    }
+
+    for (names, values) |name, value| {
+        try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+    }
+    defer for (names) |name| unsetEnvPosix(name);
+    defer {
+        // Release the entries this test captured so the test allocator
+        // stays clean and no residue leaks into later tests.
+        captured_mutex.lockUncancelable(std.testing.io);
+        defer captured_mutex.unlock(std.testing.io);
+        if (captured) |*map| {
+            for (names) |name| {
+                if (map.fetchRemove(name)) |kv| {
+                    alloc.free(@constCast(kv.key));
+                    alloc.free(kv.value);
+                }
+            }
+            if (map.count() == 0) {
+                map.deinit(alloc);
+                captured = null;
+            }
+        }
+    }
+
+    const raw_env: io_mod.RawEnviron = @ptrCast(std.c.environ);
+    captureAndScrubRaw(alloc, raw_env);
+
+    // All three must be captured, not just the first — a removal that
+    // shifts the array mid-iteration would silently drop the neighbours.
+    for (names, values) |name, value| {
+        const got = capturedGet(name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(value, got);
+    }
+    // And none may survive in environ.
+    var scan: usize = 0;
+    while (std.c.environ[scan]) |entry_z| : (scan += 1) {
+        try std.testing.expect(!isPassportEnvEntry(std.mem.sliceTo(entry_z, 0)));
+    }
 }
 
 test "resolve is disabled without settings or env" {
