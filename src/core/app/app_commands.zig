@@ -29,6 +29,9 @@ const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const passport_grant_import = @import("../passport/grant_import.zig");
+const passport_grants = @import("../passport/grants.zig");
+const passport_store_redirect = @import("../passport/store_redirect.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -795,14 +798,18 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
+            const trimmed = std.mem.trim(u8, rest, " \t");
+            const action = splitPermissionWord(trimmed) orelse return false;
+            if (std.ascii.eqlIgnoreCase(action.word, "passport")) {
+                try handlePassportGrants(app, action.rest);
+                return true;
+            }
             if (comptime !@hasField(App, "approval_prompt") or
                 !@hasField(App, "session_persistence") or
                 !@hasDecl(App, "preparePermissionStateAction"))
             {
                 return false;
             } else {
-                const trimmed = std.mem.trim(u8, rest, " \t");
-                const action = splitPermissionWord(trimmed) orelse return false;
                 const remember = std.ascii.eqlIgnoreCase(action.word, "remember");
                 const revoke = std.ascii.eqlIgnoreCase(action.word, "revoke");
                 if (!remember and !revoke) return false;
@@ -948,6 +955,254 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
+        /// `/permissions passport` — list, confirm, or deny grants recorded
+        /// under the passport's grants/ surface. Grant import is always an
+        /// explicit holder action (PS-061): nothing auto-applies, and each
+        /// decision is journaled so a grant is never re-presented.
+        fn handlePassportGrants(app: *App, rest: []const u8) !void {
+            if (comptime !@hasField(App, "permission_engine")) {
+                try writePermissionManagementNotice(
+                    app,
+                    .@"error",
+                    "passport grant management needs the permission engine",
+                );
+                return;
+            }
+            const home = io_mod.getenv("HOME") orelse {
+                try writePermissionManagementNotice(
+                    app,
+                    .@"error",
+                    "HOME is not set; cannot reach the passport store",
+                );
+                return;
+            };
+            var store = passport_store_redirect.Store.open(app.alloc, home) catch |err| {
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "passport backend unavailable: {s}",
+                    .{@errorName(err)},
+                );
+                defer app.alloc.free(body);
+                try writePermissionManagementNotice(app, .@"error", body);
+                return;
+            };
+            defer store.deinit();
+            if (!store.passportEnabled()) {
+                try writePermissionManagementNotice(
+                    app,
+                    .neutral,
+                    "passport backend is not enabled; nothing to review",
+                );
+                return;
+            }
+
+            const verb = splitPermissionWord(rest);
+            const now_ms = io_mod.milliTimestamp();
+            if (verb == null or std.ascii.eqlIgnoreCase(verb.?.word, "list")) {
+                try listPassportGrants(app, &store, home, now_ms);
+                return;
+            }
+
+            const approve = std.ascii.eqlIgnoreCase(verb.?.word, "confirm") or
+                std.ascii.eqlIgnoreCase(verb.?.word, "allow");
+            const deny = std.ascii.eqlIgnoreCase(verb.?.word, "deny") or
+                std.ascii.eqlIgnoreCase(verb.?.word, "reject");
+            const id = std.mem.trim(u8, verb.?.rest, " \t");
+            if ((!approve and !deny) or id.len == 0) {
+                try writePermissionManagementNotice(
+                    app,
+                    .@"error",
+                    "usage: /permissions passport [list]\n       /permissions passport confirm <grant-id>\n       /permissions passport deny <grant-id>",
+                );
+                return;
+            }
+            debug_trace.logf(
+                "permission",
+                "event=passport_grant_decision id={s} approve={}",
+                .{ id, approve },
+            );
+
+            // Resolve the pending grant without holding the authority
+            // mutex: listing grants may block on the passport backend.
+            const pending = passport_grant_import.listPending(
+                app.alloc,
+                &store,
+                home,
+                now_ms,
+            ) catch |err| {
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "could not list passport grants: {s}",
+                    .{@errorName(err)},
+                );
+                defer app.alloc.free(body);
+                try writePermissionManagementNotice(app, .@"error", body);
+                return;
+            };
+            defer {
+                for (pending) |*g| g.deinit(app.alloc);
+                app.alloc.free(pending);
+            }
+            const target = passport_grant_import.findPending(pending, id) orelse {
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "passport grant {s} is not pending (decided, expired, or unknown)",
+                    .{id},
+                );
+                defer app.alloc.free(body);
+                try writePermissionManagementNotice(app, .warning, body);
+                return;
+            };
+
+            if (approve) {
+                {
+                    if (comptime @hasField(App, "permission_state")) {
+                        app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                    }
+                    defer if (comptime @hasField(App, "permission_state")) {
+                        app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                    };
+                    for (passport_grants.mappedToolNames(target.action)) |tool_name| {
+                        app.permission_engine.allow(
+                            app.alloc,
+                            tool_name,
+                            target.scope,
+                        ) catch |err| {
+                            const body = try std.fmt.allocPrint(
+                                app.alloc,
+                                "could not apply passport grant {s}: {s}",
+                                .{ id, @errorName(err) },
+                            );
+                            defer app.alloc.free(body);
+                            try writePermissionManagementNotice(app, .@"error", body);
+                            return;
+                        };
+                    }
+                }
+                passport_grant_import.recordDecision(
+                    app.alloc,
+                    home,
+                    id,
+                    .confirmed,
+                ) catch |err| {
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "applied grant {s} but could not journal the decision: {s}",
+                        .{ id, @errorName(err) },
+                    );
+                    defer app.alloc.free(body);
+                    try writePermissionManagementNotice(app, .warning, body);
+                    return;
+                };
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "applied passport grant {s} for this session",
+                    .{id},
+                );
+                defer app.alloc.free(body);
+                try writePermissionManagementNotice(app, .success, body);
+                return;
+            }
+
+            passport_grant_import.recordDecision(
+                app.alloc,
+                home,
+                id,
+                .denied,
+            ) catch |err| {
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "could not journal the denial of grant {s}: {s}",
+                    .{ id, @errorName(err) },
+                );
+                defer app.alloc.free(body);
+                try writePermissionManagementNotice(app, .@"error", body);
+                return;
+            };
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "denied passport grant {s}",
+                .{id},
+            );
+            defer app.alloc.free(body);
+            try writePermissionManagementNotice(app, .neutral, body);
+        }
+
+        fn listPassportGrants(
+            app: *App,
+            store: *passport_store_redirect.Store,
+            home: []const u8,
+            now_ms: i64,
+        ) !void {
+            const pending = passport_grant_import.listPending(
+                app.alloc,
+                store,
+                home,
+                now_ms,
+            ) catch |err| {
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "could not list passport grants: {s}",
+                    .{@errorName(err)},
+                );
+                defer app.alloc.free(body);
+                try writePermissionManagementNotice(app, .@"error", body);
+                return;
+            };
+            defer {
+                for (pending) |*g| g.deinit(app.alloc);
+                app.alloc.free(pending);
+            }
+            if (pending.len == 0) {
+                try writePermissionManagementNotice(
+                    app,
+                    .neutral,
+                    "no pending passport grants",
+                );
+                return;
+            }
+            var out: std.Io.Writer.Allocating = .init(app.alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "pending passport grants ({d}):",
+                .{pending.len},
+            );
+            for (pending) |g| {
+                var action_safe = try text_utils.encodeTerminalSafe(
+                    app.alloc,
+                    g.action,
+                    128,
+                );
+                defer action_safe.deinit(app.alloc);
+                var scope_safe = try text_utils.encodeTerminalSafe(
+                    app.alloc,
+                    g.scope,
+                    256,
+                );
+                defer scope_safe.deinit(app.alloc);
+                var id_safe = try text_utils.encodeTerminalSafe(
+                    app.alloc,
+                    g.id,
+                    128,
+                );
+                defer id_safe.deinit(app.alloc);
+                var by_safe = try text_utils.encodeTerminalSafe(
+                    app.alloc,
+                    g.granted_by,
+                    128,
+                );
+                defer by_safe.deinit(app.alloc);
+                try out.writer.print(
+                    "\n  {s}  {s}  scope: {s}  by: {s}",
+                    .{ id_safe.bytes, action_safe.bytes, scope_safe.bytes, by_safe.bytes },
+                );
+            }
+            try out.writer.writeAll(
+                "\nconfirm with /permissions passport confirm <grant-id>",
+            );
+            try writePermissionManagementNotice(app, .neutral, out.written());
+        }
+
         const PermissionWord = struct {
             word: []const u8,
             rest: []const u8,
@@ -967,7 +1222,7 @@ pub fn Handlers(comptime App: type) type {
             try writePermissionManagementNotice(
                 app,
                 .@"error",
-                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>",
+                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>\n       /permissions passport [list|confirm <grant-id>|deny <grant-id>]",
             );
         }
 

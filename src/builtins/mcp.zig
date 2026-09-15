@@ -13,6 +13,7 @@ const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
+const store_redirect = @import("../core/passport/store_redirect.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -23,6 +24,7 @@ const McpTransport = mcp_contract.McpTransport;
 
 const add_usage = "Usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>";
 const profile_lock_deadline_ms: u64 = 2_000;
+const mcp_surface = "mcp.json";
 
 pub const command_provider = command_provider_contract.Provider{ .handle_fn = handleCommand };
 
@@ -805,18 +807,46 @@ fn runtimeFromConfigs(
     return runtime;
 }
 
-pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .empty;
-        logConfigFailure("open", path, err);
-        return err;
-    };
-    defer file.close(io_mod.getIo());
+/// When the passport backend is enabled the profile mcp.json surface lives
+/// in the encrypted store. The home dir is recovered from the canonical
+/// <home>/.fx/mcp.json layout; a null result keeps the local file path.
+/// Misconfigured-but-enabled passport state fails closed instead of falling
+/// back to the local file.
+fn openPassportStore(alloc: Allocator, path: []const u8) !?store_redirect.Store {
+    const fx_dir = std.fs.path.dirname(path) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(fx_dir), profile_paths.root_dir_name)) return null;
+    const home = std.fs.path.dirname(fx_dir) orelse return null;
+    var store = try store_redirect.Store.open(alloc, home);
+    if (!store.passportEnabled()) {
+        store.deinit();
+        return null;
+    }
+    return store;
+}
 
-    const json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
-        logConfigFailure("read", path, err);
-        return err;
-    };
+pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
+    var json_text: []u8 = undefined;
+    var maybe_store = try openPassportStore(alloc, path);
+    defer if (maybe_store) |*store| store.deinit();
+    if (maybe_store) |*store| {
+        const remote = store.readSurface(alloc, mcp_surface) catch |err| {
+            logConfigFailure("read", path, err);
+            return err;
+        };
+        json_text = remote orelse return .empty;
+    } else {
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
+            if (err == error.FileNotFound) return .empty;
+            logConfigFailure("open", path, err);
+            return err;
+        };
+        defer file.close(io_mod.getIo());
+
+        json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
+            logConfigFailure("read", path, err);
+            return err;
+        };
+    }
     defer alloc.free(json_text);
 
     return loadConfigFromJson(alloc, json_text) catch |err| {
@@ -920,12 +950,20 @@ fn loadProfileDocumentFromPath(
     alloc: Allocator,
     path: []const u8,
 ) !project_config.ProfileParseResult {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .{};
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-    const json_text = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    var json_text: []u8 = undefined;
+    var maybe_store = try openPassportStore(alloc, path);
+    defer if (maybe_store) |*store| store.deinit();
+    if (maybe_store) |*store| {
+        const remote = try store.readSurface(alloc, mcp_surface);
+        json_text = remote orelse return .{};
+    } else {
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
+            if (err == error.FileNotFound) return .{};
+            return err;
+        };
+        defer file.close(io_mod.getIo());
+        json_text = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    }
     defer alloc.free(json_text);
     return project_config.parseProfileDocument(alloc, json_text);
 }
@@ -945,6 +983,12 @@ fn acquireProfileMutationLock(path: []const u8) !io_mod.TimedAdvisoryLock {
 fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpServerConfig) !void {
     const json = try renderConfigJson(alloc, configs);
     defer alloc.free(json);
+
+    var maybe_store = try openPassportStore(alloc, path);
+    defer if (maybe_store) |*store| store.deinit();
+    if (maybe_store) |*store| {
+        return store.writeSurface(alloc, mcp_surface, json);
+    }
 
     const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
     const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;

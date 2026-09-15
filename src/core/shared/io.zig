@@ -15,6 +15,16 @@ var global_environ: ?*const std.process.Environ.Map = null;
 var global_environ_block: ?std.process.Environ.Block = null;
 var global_raw_environ: ?RawEnviron = null;
 
+/// When set, cloneEnvironMap drops every key for which the hook returns
+/// true. Installed once at startup by the passport config layer so
+/// FX_PASSPORT_* secrets never reach spawned children regardless of which
+/// environ representation (raw envp, block, or host-provided map) is live.
+var environ_scrub_hook: ?*const fn (key: []const u8) bool = null;
+
+pub fn setEnvironScrubHook(hook: ?*const fn (key: []const u8) bool) void {
+    environ_scrub_hook = hook;
+}
+
 pub fn setIo(zio: std.Io) void {
     real_io = process_io_for(builtin.os.tag, zio);
 }
@@ -404,20 +414,31 @@ pub const CloneEnvironMapError = std.mem.Allocator.Error ||
 pub fn cloneEnvironMap(
     alloc: std.mem.Allocator,
 ) CloneEnvironMapError!std.process.Environ.Map {
-    if (global_environ) |map| return map.clone(alloc);
-    if (global_environ_block) |block| {
-        return std.process.Environ.createMap(.{ .block = block }, alloc);
-    }
-    if (global_raw_environ) |raw| {
+    var map: std.process.Environ.Map = undefined;
+    if (global_environ) |src| {
+        map = try src.clone(alloc);
+    } else if (global_environ_block) |block| {
+        map = try std.process.Environ.createMap(.{ .block = block }, alloc);
+    } else if (global_raw_environ) |raw| {
         var len: usize = 0;
         while (raw[len] != null) : (len += 1) {}
         const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
-        var map = std.process.Environ.Map.init(alloc);
+        map = std.process.Environ.Map.init(alloc);
         errdefer map.deinit();
         try map.putPosixBlock(.{ .slice = entries });
-        return map;
+    } else {
+        return error.EnvironmentUnavailable;
     }
-    return error.EnvironmentUnavailable;
+    if (environ_scrub_hook) |hook| {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(alloc);
+        var it = map.iterator();
+        while (it.next()) |kv| {
+            if (hook(kv.key_ptr.*)) try keys.append(alloc, kv.key_ptr.*);
+        }
+        for (keys.items) |key| _ = map.orderedRemove(key);
+    }
+    return map;
 }
 
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
@@ -1085,6 +1106,57 @@ test "cloneEnvironMap copies installed raw environment state" {
     defer cloned.deinit();
     try std.testing.expectEqualStrings("/raw/bin", cloned.get("PATH").?);
     try std.testing.expectEqualStrings("/raw/home", cloned.get("HOME").?);
+}
+
+test "cloneEnvironMap applies the scrub hook across map, block, and raw state" {
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    const previous_hook = environ_scrub_hook;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+        environ_scrub_hook = previous_hook;
+    }
+
+    const hook = struct {
+        fn dropSecret(key: []const u8) bool {
+            return std.mem.startsWith(u8, key, "SECRET_");
+        }
+    }.dropSecret;
+    setEnvironScrubHook(hook);
+
+    var source = std.process.Environ.Map.init(std.testing.allocator);
+    defer source.deinit();
+    try source.put("SECRET_TOKEN", "hidden");
+    try source.put("VISIBLE", "yes");
+
+    setEnvironMap(&source);
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expect(cloned.get("SECRET_TOKEN") == null);
+    try std.testing.expectEqualStrings("yes", cloned.get("VISIBLE").?);
+    // The source map is untouched: scrubbing applies to the clone only.
+    try std.testing.expectEqualStrings("hidden", source.get("SECRET_TOKEN").?);
+
+    const block = try source.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    setEnvironBlock(block);
+    var from_block = try cloneEnvironMap(std.testing.allocator);
+    defer from_block.deinit();
+    try std.testing.expect(from_block.get("SECRET_TOKEN") == null);
+    try std.testing.expectEqualStrings("yes", from_block.get("VISIBLE").?);
+
+    const raw_entries = [_:null]?[*:0]const u8{
+        "SECRET_TOKEN=hidden",
+        "VISIBLE=yes",
+    };
+    setRawEnviron(@ptrCast(&raw_entries));
+    var from_raw = try cloneEnvironMap(std.testing.allocator);
+    defer from_raw.deinit();
+    try std.testing.expect(from_raw.get("SECRET_TOKEN") == null);
+    try std.testing.expectEqualStrings("yes", from_raw.get("VISIBLE").?);
 }
 
 test "readFileToEnd: file under cap returns full content" {

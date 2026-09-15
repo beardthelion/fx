@@ -48,6 +48,9 @@ const model_provider = @import("core/config/model_provider.zig");
 const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
 const prompt_policy = @import("core/config/prompt_policy.zig");
+const passport_config = @import("core/passport/config.zig");
+const passport_grant_import = @import("core/passport/grant_import.zig");
+const passport_store_redirect = @import("core/passport/store_redirect.zig");
 const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
@@ -1734,9 +1737,38 @@ const App = struct {
     }
 
     pub fn allowToolForSession(self: *App, tool_name: []const u8, target_path: []const u8) !void {
-        self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-        defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
-        try self.permission_engine.allow(self.alloc, tool_name, target_path);
+        {
+            self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
+            try self.permission_engine.allow(self.alloc, tool_name, target_path);
+        }
+        self.recordPassportGrant(tool_name, target_path);
+    }
+
+    /// Record a holder-confirmed session grant into the passport (PS-062).
+    /// Only called for grants the holder already approved through fx's own
+    /// prompts or commands. Best-effort outside the authority lock: a
+    /// record failure must not stall or fail the local grant.
+    fn recordPassportGrant(self: *App, tool_name: []const u8, target_path: []const u8) void {
+        const home = io_mod.getenv("HOME") orelse return;
+        var store = passport_store_redirect.Store.open(self.alloc, home) catch return;
+        defer store.deinit();
+        if (!store.passportEnabled()) return;
+        const id = passport_grant_import.recordToolGrant(
+            self.alloc,
+            &store,
+            tool_name,
+            target_path,
+            io_mod.milliTimestamp(),
+        ) catch |err| {
+            debug_trace.logf(
+                "passport",
+                "event=grant_record_failed tool={s} err={s}",
+                .{ tool_name, @errorName(err) },
+            );
+            return;
+        };
+        if (id) |gid| self.alloc.free(gid);
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
@@ -2973,6 +3005,11 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
+    // Capture and scrub FX_PASSPORT_* before the environ is installed
+    // anywhere: the captured map keeps them readable for fx config while
+    // envp, environ blocks, and every child process never see them.
+    passport_config.captureAndScrubRaw(processAllocator(), raw_env);
+
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
@@ -4056,6 +4093,15 @@ test {
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_commands.zig");
     _ = @import("core/shared/io.zig");
+    _ = @import("core/passport/crypto.zig");
+    _ = @import("core/passport/identity.zig");
+    _ = @import("core/passport/secretscan.zig");
+    _ = @import("core/passport/config.zig");
+    _ = @import("core/passport/client.zig");
+    _ = @import("core/passport/grants.zig");
+    _ = @import("core/passport/grant_import.zig");
+    _ = @import("core/passport/session_sync.zig");
+    _ = @import("core/passport/store_redirect.zig");
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");

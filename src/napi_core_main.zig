@@ -8,6 +8,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
+const passport_config = @import("core/passport/config.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
@@ -541,6 +542,9 @@ fn ensureThreadedIo() void {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
+        // Same custody rule as the CLI entry: capture FX_PASSPORT_* for fx
+        // config, then strip them so spawned children never inherit them.
+        passport_config.captureAndScrubRaw(std.heap.c_allocator, raw_environ);
         io_mod.setRawEnviron(raw_environ);
         const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
         defer if (workspace_root) |path| std.heap.c_allocator.free(path);

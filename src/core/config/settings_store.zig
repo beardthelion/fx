@@ -9,6 +9,7 @@ const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const store_redirect = @import("../passport/store_redirect.zig");
 const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
@@ -315,21 +316,49 @@ pub const Store = struct {
     fail_parent_sync_after_rename: bool = false,
     fail_migration_snapshot: bool = false,
     last_failure_cleanup: LegacyCleanup = .{},
+    /// Live when the passport backend is enabled; owned. The primary
+    /// settings document routes through it while backups stay local.
+    passport: ?*store_redirect.Store = null,
 
-    fn initReadOnlyAbsent(alloc: Allocator, home_path: []const u8) !Store {
+    fn initReadOnlyAbsent(
+        alloc: Allocator,
+        home_path: []const u8,
+        passport: ?*store_redirect.Store,
+    ) !Store {
         return .{
             .durable_home = null,
             .display_root = try profile_paths.rootDir(alloc, home_path),
             .availability = .read_only_absent,
             .mode = .read_only,
+            .passport = passport,
         };
     }
 
+    /// Opens the passport store for this home when the backend is enabled.
+    /// Misconfigured enabled state propagates rather than silently falling
+    /// back to local settings.
+    fn openPassportStore(alloc: Allocator, home_path: []const u8) !?*store_redirect.Store {
+        var store = try store_redirect.Store.open(alloc, home_path);
+        if (!store.passportEnabled()) {
+            store.deinit();
+            return null;
+        }
+        const ptr = try alloc.create(store_redirect.Store);
+        errdefer alloc.destroy(ptr);
+        ptr.* = store;
+        return ptr;
+    }
+
     pub fn initFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode) !Store {
+        const passport = try openPassportStore(alloc, home_path);
+        errdefer if (passport) |p| {
+            p.deinit();
+            alloc.destroy(p);
+        };
         const zio = io_mod.getIo();
         var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
-                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
+                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path, passport);
                 return err;
             },
             else => return err,
@@ -341,7 +370,7 @@ pub const Store = struct {
             .follow_symlinks = false,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
-                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
+                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path, passport);
 
                 var verified_home = io_mod.VerifiedDir{
                     .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }),
@@ -375,11 +404,16 @@ pub const Store = struct {
             .display_root = try io_mod.dirRealpathAlloc(alloc, durable_home, "."),
             .availability = .writable,
             .mode = mode,
+            .passport = passport,
         };
     }
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
         self.last_failure_cleanup.deinit(alloc);
+        if (self.passport) |p| {
+            p.deinit();
+            alloc.destroy(p);
+        }
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.display_root);
         self.* = undefined;
@@ -465,7 +499,11 @@ pub const Store = struct {
         operation: []const u8,
         mutation_mode: []const u8,
     ) !CommitOutcome {
-        if (self.mode != .writable or self.durable_home == null) return error.SettingsStoreUnavailable;
+        if (self.mode != .writable or
+            (self.durable_home == null and self.passport == null))
+        {
+            return error.SettingsStoreUnavailable;
+        }
         try validateMutation(mutation);
         if (mutation.isEmpty()) {
             debug_trace.logf(
@@ -476,12 +514,18 @@ pub const Store = struct {
             return .unchanged;
         }
 
-        var lock = io_mod.acquireTimedAdvisoryLock(&self.durable_home.?, "settings.lock", lock_deadline_ms) catch |err| switch (err) {
-            error.LockBusy => return error.SettingsLockBusy,
-            error.LockUnsupported => return error.SettingsLockUnsupported,
-            else => return err,
-        };
-        defer lock.release();
+        // The advisory lock guards the local document and backups; in
+        // passport mode the primary lives remotely and the backend's
+        // manifest transaction is the concurrency boundary.
+        var lock: ?io_mod.TimedAdvisoryLock = null;
+        if (self.durable_home) |*durable| {
+            lock = io_mod.acquireTimedAdvisoryLock(durable, "settings.lock", lock_deadline_ms) catch |err| switch (err) {
+                error.LockBusy => return error.SettingsLockBusy,
+                error.LockUnsupported => return error.SettingsLockUnsupported,
+                else => return err,
+            };
+        }
+        defer if (lock) |*l| l.release();
 
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
@@ -561,29 +605,36 @@ pub const Store = struct {
             const precommit_fingerprint = fingerprintOptional(precommit_bytes);
             if (!std.mem.eql(u8, &original_fingerprint, &precommit_fingerprint)) continue;
 
-            const durable_ops = if (self.fail_parent_sync_after_rename)
-                io_mod.DurableOps{ .ctx = self, .sync_dir = failStoreParentSync }
-            else
-                io_mod.DurableOps{};
-            io_mod.durableReplaceVerifiedWithOps(
-                alloc,
-                &self.durable_home.?,
-                "settings.json",
-                candidate,
-                durable_ops,
-            ) catch |err| switch (err) {
-                error.DurableReplacePostRenameFailed => {
-                    self.last_failure_cleanup = .{
-                        .fields_removed = application.legacy_fields_removed,
-                        .workspaces_changed = application.legacy_workspaces_changed,
-                        .recovery_paths = recovery_paths,
-                    };
-                    recovery_paths_owned = false;
-                    return error.SettingsCommitIndeterminate;
-                },
-                error.DurableReplacePreRenameFailed => return error.SettingsCommitFailed,
-                else => return err,
-            };
+            if (self.passport) |passport_store| {
+                passport_store.writeSurface(alloc, "settings.json", candidate) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.SettingsCommitFailed,
+                };
+            } else {
+                const durable_ops = if (self.fail_parent_sync_after_rename)
+                    io_mod.DurableOps{ .ctx = self, .sync_dir = failStoreParentSync }
+                else
+                    io_mod.DurableOps{};
+                io_mod.durableReplaceVerifiedWithOps(
+                    alloc,
+                    &self.durable_home.?,
+                    "settings.json",
+                    candidate,
+                    durable_ops,
+                ) catch |err| switch (err) {
+                    error.DurableReplacePostRenameFailed => {
+                        self.last_failure_cleanup = .{
+                            .fields_removed = application.legacy_fields_removed,
+                            .workspaces_changed = application.legacy_workspaces_changed,
+                            .recovery_paths = recovery_paths,
+                        };
+                        recovery_paths_owned = false;
+                        return error.SettingsCommitIndeterminate;
+                    },
+                    error.DurableReplacePreRenameFailed => return error.SettingsCommitFailed,
+                    else => return err,
+                };
+            }
             self.commit_count += 1;
             debug_trace.logf(
                 "config",
@@ -702,6 +753,17 @@ pub const Store = struct {
     }
 
     fn loadRawPrimary(self: *Store, alloc: Allocator) !RawPrimary {
+        if (self.passport) |store| {
+            const remote = try store.readSurface(alloc, "settings.json");
+            if (remote) |bytes| {
+                if (bytes.len > max_settings_bytes) {
+                    alloc.free(bytes);
+                    return .oversized;
+                }
+                return .{ .bytes = bytes };
+            }
+            return .absent;
+        }
         if (self.durable_home == null) return .absent;
         const zio = io_mod.getIo();
         const open_mode: std.Io.Dir.OpenFileOptions.Mode =
@@ -759,6 +821,7 @@ pub const Store = struct {
         bytes: []const u8,
         keep_count: usize,
     ) !void {
+        if (self.durable_home == null) return;
         var backups = try io_mod.openOrCreateVerifiedPrivateDir(&self.durable_home.?, profile_paths.backups_dir_name);
         defer backups.close();
         if (std.mem.eql(u8, kind, "corrupt") and try containsCopyWithFingerprint(alloc, backups.dir, kind, bytes)) return;
@@ -786,6 +849,10 @@ pub const Store = struct {
         if (migration_fields == 0) return &.{};
         const bytes = existing orelse return error.InvalidSettingsFormat;
         if (self.fail_migration_snapshot) return error.InjectedMigrationSnapshotFailure;
+        // Migration snapshots are recovery backups: local-only. With no
+        // local home there is nowhere to write them, so the mutation must
+        // not proceed without its rollback path.
+        if (self.durable_home == null) return error.SettingsMigrationSnapshotFailed;
         var paths: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (paths.items) |path| alloc.free(path);

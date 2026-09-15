@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
 const profile_paths = @import("../../core/shared/profile_paths.zig");
+const store_redirect = @import("../../core/passport/store_redirect.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
@@ -105,6 +106,8 @@ pub fn execute(arena: Allocator, args_json: []const u8) ![]u8 {
     return runMemory(arena, action, fact);
 }
 
+const memories_surface = "memories.json";
+
 fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     if (!isSupportedAction(action)) return error.UnsupportedMemoryAction;
 
@@ -112,9 +115,18 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
 
+    // When the passport backend is enabled the memories surface lives in
+    // the encrypted store; when it is not, every call below takes the same
+    // local file path as before.
+    var store = store_redirect.Store.open(alloc, home) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MemoryStoreUnreadable,
+    };
+    defer store.deinit();
+
     if (std.mem.eql(u8, action, "save")) {
         const fact_value = fact orelse return std.fmt.allocPrint(alloc, "no fact provided", .{});
-        var existing = try loadMemories(alloc, memories_path);
+        var existing = try loadMemories(alloc, &store, memories_path);
         defer freeMemories(alloc, &existing);
 
         for (existing.items) |memory| {
@@ -122,12 +134,12 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
         }
 
         try existing.append(alloc, try alloc.dupe(u8, fact_value));
-        try saveMemories(alloc, memories_path, existing.items);
+        try saveMemories(alloc, &store, memories_path, existing.items);
         return std.fmt.allocPrint(alloc, "remembered", .{});
     }
 
     if (std.mem.eql(u8, action, "list")) {
-        var existing = try loadMemories(alloc, memories_path);
+        var existing = try loadMemories(alloc, &store, memories_path);
         defer freeMemories(alloc, &existing);
 
         if (existing.items.len == 0) return std.fmt.allocPrint(alloc, "No saved memories", .{});
@@ -141,10 +153,14 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     }
 
     if (std.mem.eql(u8, action, "clear")) {
-        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return error.MemoryClearFailed,
-        };
+        if (store.passportEnabled()) {
+            store.deleteSurface(alloc, memories_surface) catch return error.MemoryClearFailed;
+        } else {
+            std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return error.MemoryClearFailed,
+            };
+        }
         return std.fmt.allocPrint(alloc, "memories cleared", .{});
     }
 
@@ -157,20 +173,33 @@ fn isSupportedAction(action: []const u8) bool {
         std.mem.eql(u8, action, "clear");
 }
 
-fn loadMemories(alloc: Allocator, path: []const u8) MemoryStoreError!std.ArrayList([]u8) {
+fn loadMemories(alloc: Allocator, store: ?*store_redirect.Store, path: []const u8) MemoryStoreError!std.ArrayList([]u8) {
     var list: std.ArrayList([]u8) = .empty;
     errdefer freeMemories(alloc, &list);
 
-    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
-        error.FileNotFound => return list,
-        else => return error.MemoryStoreUnreadable,
-    };
-    defer file.close(io_mod.getIo());
-    const content = io_mod.readFileToEnd(alloc, &file, max_memory_store_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return error.MemoryStoreTooLarge,
-        else => return error.MemoryStoreUnreadable,
-    };
+    var content: []u8 = undefined;
+    if (store != null and store.?.passportEnabled()) {
+        const remote = store.?.readSurface(alloc, memories_surface) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.MemoryStoreUnreadable,
+        };
+        content = remote orelse return list;
+        if (content.len > max_memory_store_bytes) {
+            alloc.free(content);
+            return error.MemoryStoreTooLarge;
+        }
+    } else {
+        var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
+            error.FileNotFound => return list,
+            else => return error.MemoryStoreUnreadable,
+        };
+        defer file.close(io_mod.getIo());
+        content = io_mod.readFileToEnd(alloc, &file, max_memory_store_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.StreamTooLong => return error.MemoryStoreTooLarge,
+            else => return error.MemoryStoreUnreadable,
+        };
+    }
     defer alloc.free(content);
 
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch |err| switch (err) {
@@ -196,12 +225,7 @@ fn freeMemories(alloc: Allocator, list: *std.ArrayList([]u8)) void {
     list.deinit(alloc);
 }
 
-fn saveMemories(alloc: Allocator, path: []const u8, memories: []const []u8) !void {
-    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    std.Io.Dir.createDirAbsolute(io_mod.getIo(), dir_path, .default_dir) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-    };
-
+fn saveMemories(alloc: Allocator, store: ?*store_redirect.Store, path: []const u8, memories: []const []u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeByte('[');
@@ -216,6 +240,14 @@ fn saveMemories(alloc: Allocator, path: []const u8, memories: []const []u8) !voi
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
 
+    if (store != null and store.?.passportEnabled()) {
+        return store.?.writeSurface(alloc, memories_surface, json);
+    }
+
+    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    std.Io.Dir.createDirAbsolute(io_mod.getIo(), dir_path, .default_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
     try io_mod.writeFileAtomic(alloc, path, json);
 }
 
@@ -393,7 +425,7 @@ test "memory loader distinguishes missing oversized and unreadable stores" {
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
 
-    var missing = try loadMemories(alloc, memories_path);
+    var missing = try loadMemories(alloc, null, memories_path);
     defer freeMemories(alloc, &missing);
     try std.testing.expectEqual(@as(usize, 0), missing.items.len);
 
@@ -404,14 +436,14 @@ test "memory loader distinguishes missing oversized and unreadable stores" {
     }
     try std.testing.expectError(
         error.MemoryStoreTooLarge,
-        loadMemories(alloc, memories_path),
+        loadMemories(alloc, null, memories_path),
     );
 
     try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path);
     try std.Io.Dir.createDirAbsolute(io_mod.getIo(), memories_path, .default_dir);
     try std.testing.expectError(
         error.MemoryStoreUnreadable,
-        loadMemories(alloc, memories_path),
+        loadMemories(alloc, null, memories_path),
     );
 }
 

@@ -21,6 +21,7 @@ const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
+const session_sync = @import("../passport/session_sync.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -687,12 +688,17 @@ pub const Store = struct {
             recovery_staging_dir,
         );
         errdefer staging.close();
+        const home_path = try alloc.dupe(u8, root.home_path);
+        errdefer alloc.free(home_path);
+        const display_root = try std.fs.path.join(
+            alloc,
+            &.{ self.sessions_dir, recovery_staging_dir },
+        );
+        errdefer alloc.free(display_root);
         return .{
             .sessions = staging,
-            .display_root = try std.fs.path.join(
-                alloc,
-                &.{ self.sessions_dir, recovery_staging_dir },
-            ),
+            .display_root = display_root,
+            .home_path = home_path,
             .mode = .writable,
         };
     }
@@ -968,6 +974,18 @@ pub const Store = struct {
             );
             return .indeterminate;
         };
+        // The passport mirror must go too; a stale remote copy would
+        // resurrect the session on the next hydrate.
+        if (self.canonical_root.passport) |passport_store| {
+            session_sync.deleteSession(alloc, passport_store, loaded.active_id) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event={s} disposition=indeterminate stage=passport_delete err={s}",
+                    .{ event_name, @errorName(err) },
+                );
+                return .indeterminate;
+            };
+        }
         latest_pointer.removeDeferredToken(
             sessions,
             loaded.active_id,
@@ -1813,7 +1831,7 @@ pub const Store = struct {
         options: ResumeOptions,
     ) !ReadOnlyDetail {
         try validateSessionId(session_id);
-        var session_dir = try self.openSessionDir(session_id);
+        var session_dir = try self.openSessionDirHydrated(alloc, session_id);
         defer session_dir.close();
         const authority = try classifyAuthority(alloc, &session_dir, session_id);
         return switch (authority) {
@@ -3076,6 +3094,36 @@ pub const Store = struct {
         return .{ .dir = dir };
     }
 
+    /// Opens a session dir by id like openSessionDir, but hydrates the
+    /// session from the passport mirror first when it is absent locally.
+    /// Hydration runs on a throwaway root copy: a sessions dir
+    /// materialized for the lookup is closed again once the session dir
+    /// holds its own descriptor. Mirror failures propagate; an unmirrored
+    /// id still reports SessionNotFound.
+    fn openSessionDirHydrated(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !io_mod.VerifiedDir {
+        return self.openSessionDir(session_id) catch |err| switch (err) {
+            error.SessionNotFound => blk: {
+                var root = self.canonical_root;
+                if (root.passport == null) return error.SessionNotFound;
+                const materialized = root.sessions == null;
+                if (!try root.hydrateFromPassport(alloc, session_id)) {
+                    return error.SessionNotFound;
+                }
+                defer if (materialized) {
+                    if (root.sessions) |*s| s.close();
+                };
+                var store = self;
+                store.canonical_root = root;
+                break :blk try store.openSessionDir(session_id);
+            },
+            else => return err,
+        };
+    }
+
     fn loadLegacyReadOnlyDetail(
         self: Store,
         alloc: Allocator,
@@ -3148,7 +3196,7 @@ pub const Store = struct {
         options: ResumeOptions,
     ) !LoadedWritableSession {
         try validateSessionId(session_id);
-        var session_dir = try self.openSessionDir(session_id);
+        var session_dir = try self.openSessionDirHydrated(alloc, session_id);
         defer session_dir.close();
         const authority = classifyAuthority(
             alloc,
@@ -3364,7 +3412,7 @@ pub const Store = struct {
         workspace_root: []const u8,
         options: ResumeOptions,
     ) !WritableCandidate {
-        var session_dir = try self.openSessionDir(session_id);
+        var session_dir = try self.openSessionDirHydrated(alloc, session_id);
         defer session_dir.close();
         return switch (try classifyAuthority(alloc, &session_dir, session_id)) {
             .legacy => {
@@ -3756,7 +3804,7 @@ pub const Store = struct {
         options: MigrationOptions,
     ) !SessionMigrationResult {
         try validateSessionId(session_id);
-        var session_dir = try self.openSessionDir(session_id);
+        var session_dir = try self.openSessionDirHydrated(alloc, session_id);
         const authority = (if (options.allow_large)
             classifyAuthorityAllowingLargeLegacy(alloc, &session_dir, session_id)
         else
@@ -3855,11 +3903,24 @@ pub const Store = struct {
         options: session_log.Options,
     ) !SessionRecoveryResult {
         try validateSessionId(session_id);
-        var source = try self.openWritableSessionDir(
+        var source = self.openWritableSessionDir(
             alloc,
             session_id,
             options.session_lock_deadline_ms,
-        );
+        ) catch |err| switch (err) {
+            error.SessionNotFound => blk: {
+                var root = self.canonical_root;
+                if (!try root.hydrateFromPassport(alloc, session_id)) {
+                    return error.SessionNotFound;
+                }
+                break :blk try self.openWritableSessionDir(
+                    alloc,
+                    session_id,
+                    options.session_lock_deadline_ms,
+                );
+            },
+            else => return err,
+        };
         defer source.deinit(alloc);
         const authority = try classifyAuthority(
             alloc,

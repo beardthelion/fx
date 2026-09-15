@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_codec = @import("session_codec.zig");
+const store_redirect = @import("../passport/store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
 const history_file = profile_paths.prompt_history_file_name;
@@ -52,6 +53,59 @@ const LineRead = struct {
     next_offset: u64,
 };
 
+/// Positional byte source for the reverse-scan and rewrite helpers: an
+/// open history file locally, or an in-memory buffer fetched from the
+/// passport backend.
+const ByteSource = struct {
+    ctx: *anyopaque,
+    lengthFn: *const fn (ctx: *anyopaque) anyerror!u64,
+    readFn: *const fn (ctx: *anyopaque, buf: []u8, offset: u64) anyerror!usize,
+
+    fn fromFile(file: *std.Io.File) ByteSource {
+        return .{ .ctx = file, .lengthFn = fileLength, .readFn = fileRead };
+    }
+
+    fn fromBytes(ctx: *const BytesContext) ByteSource {
+        return .{ .ctx = @constCast(ctx), .lengthFn = bytesLength, .readFn = bytesRead };
+    }
+
+    fn len(self: ByteSource) !u64 {
+        return self.lengthFn(self.ctx);
+    }
+
+    fn readAt(self: ByteSource, buf: []u8, offset: u64) !usize {
+        return self.readFn(self.ctx, buf, offset);
+    }
+
+    const BytesContext = struct {
+        bytes: []const u8,
+    };
+
+    fn fileLength(ctx: *anyopaque) !u64 {
+        const file: *std.Io.File = @ptrCast(@alignCast(ctx));
+        return file.length(io_mod.getIo());
+    }
+
+    fn fileRead(ctx: *anyopaque, buf: []u8, offset: u64) !usize {
+        const file: *std.Io.File = @ptrCast(@alignCast(ctx));
+        return file.readPositionalAll(io_mod.getIo(), buf, offset);
+    }
+
+    fn bytesLength(ctx: *anyopaque) !u64 {
+        const bytes: *const BytesContext = @ptrCast(@alignCast(ctx));
+        return bytes.bytes.len;
+    }
+
+    fn bytesRead(ctx: *anyopaque, buf: []u8, offset: u64) !usize {
+        const bytes: *const BytesContext = @ptrCast(@alignCast(ctx));
+        if (offset >= bytes.bytes.len) return 0;
+        const available = bytes.bytes[@intCast(offset)..];
+        const count = @min(buf.len, available.len);
+        @memcpy(buf[0..count], available[0..count]);
+        return count;
+    }
+};
+
 pub const Store = struct {
     home_path: []u8,
     display_path: []u8,
@@ -64,8 +118,31 @@ pub const Store = struct {
     fail_layout_creation: bool = false,
     fail_private_mode: bool = false,
     fail_history_parent_sync: bool = false,
+    /// Live when the passport backend is enabled; owned. The history
+    /// document routes through it instead of the local file.
+    passport: ?*store_redirect.Store = null,
+
+    /// Opens the passport store for this home when the backend is enabled.
+    /// Misconfigured enabled state propagates rather than silently falling
+    /// back to a local history file.
+    fn openPassportStore(alloc: Allocator, home_path: []const u8) !?*store_redirect.Store {
+        var store = try store_redirect.Store.open(alloc, home_path);
+        if (!store.passportEnabled()) {
+            store.deinit();
+            return null;
+        }
+        const ptr = try alloc.create(store_redirect.Store);
+        errdefer alloc.destroy(ptr);
+        ptr.* = store;
+        return ptr;
+    }
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
+        const passport = try openPassportStore(alloc, home_path);
+        errdefer if (passport) |p| {
+            p.deinit();
+            alloc.destroy(p);
+        };
         const zio = io_mod.getIo();
         var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
         defer home.close(zio);
@@ -89,10 +166,15 @@ pub const Store = struct {
             .home_path = try alloc.dupe(u8, home_path),
             .display_path = try profile_paths.promptHistoryPath(alloc, home_path),
             .durable_home = durable_home,
+            .passport = passport,
         };
     }
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
+        if (self.passport) |p| {
+            p.deinit();
+            alloc.destroy(p);
+        }
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.home_path);
         alloc.free(self.display_path);
@@ -110,6 +192,10 @@ pub const Store = struct {
         const line = try serializeRecord(alloc, timestamp_ms, workspace_root, text);
         defer alloc.free(line);
         if (line.len > max_record_bytes) return .record_too_large;
+
+        if (self.passport != null) {
+            return self.appendRemote(alloc, line, workspace_root, text);
+        }
 
         try self.ensureWritable();
         var lock = self.acquireLock() catch |err| switch (err) {
@@ -157,13 +243,33 @@ pub const Store = struct {
         limit: usize,
     ) ![]LoadedPromptHistoryEntry {
         try validateWorkspaceRoot(workspace_root);
+        if (self.passport) |store| {
+            if (limit == 0) return alloc.alloc(LoadedPromptHistoryEntry, 0);
+            const remote = (try store.readSurface(alloc, history_file)) orelse
+                return alloc.alloc(LoadedPromptHistoryEntry, 0);
+            defer alloc.free(remote);
+            const ctx: ByteSource.BytesContext = .{ .bytes = remote };
+            return self.loadRecentFromSource(
+                alloc,
+                ByteSource.fromBytes(&ctx),
+                workspace_root,
+                limit,
+                remote.len,
+            );
+        }
         try self.resolveIndeterminate();
         if (limit == 0) return alloc.alloc(LoadedPromptHistoryEntry, 0);
         var file = (try self.openHistory(false, false)) orelse
             return alloc.alloc(LoadedPromptHistoryEntry, 0);
         defer file.close(io_mod.getIo());
         const boundary = try file.length(io_mod.getIo());
-        return self.loadRecentFromFile(alloc, file, workspace_root, limit, boundary);
+        return self.loadRecentFromSource(
+            alloc,
+            ByteSource.fromFile(&file),
+            workspace_root,
+            limit,
+            boundary,
+        );
     }
 
     pub fn clearWorkspace(
@@ -172,6 +278,20 @@ pub const Store = struct {
         workspace_root: []const u8,
     ) !void {
         try validateWorkspaceRoot(workspace_root);
+        if (self.passport) |store| {
+            const remote = (try store.readSurface(alloc, history_file)) orelse return;
+            defer alloc.free(remote);
+            const ctx: ByteSource.BytesContext = .{ .bytes = remote };
+            const replacement = try filterOtherWorkspaceRecords(
+                alloc,
+                ByteSource.fromBytes(&ctx),
+                remote.len,
+                workspace_root,
+            );
+            defer alloc.free(replacement);
+            try store.writeSurface(alloc, history_file, replacement);
+            return;
+        }
         if (self.durable_home == null) return;
         var probe = (try self.openHistory(false, false)) orelse return;
         probe.close(io_mod.getIo());
@@ -191,7 +311,7 @@ pub const Store = struct {
         const length = try file.length(io_mod.getIo());
         const replacement = try filterOtherWorkspaceRecords(
             alloc,
-            file,
+            ByteSource.fromFile(&file),
             length,
             workspace_root,
         );
@@ -334,6 +454,70 @@ pub const Store = struct {
         self.indeterminate = false;
     }
 
+    /// Passport-mode append: read the remote document, repair its tail,
+    /// dedup against the newest record for this workspace, then write one
+    /// candidate back. The backend's manifest transaction is the
+    /// atomicity boundary, so there is no indeterminate state to resolve.
+    fn appendRemote(
+        self: *Store,
+        alloc: Allocator,
+        line: []const u8,
+        workspace_root: []const u8,
+        text: []const u8,
+    ) !AppendOutcome {
+        const store = self.passport.?;
+        const existing = (try store.readSurface(alloc, history_file)) orelse
+            try alloc.dupe(u8, "");
+        defer alloc.free(existing);
+
+        // Tail repair: drop a trailing incomplete line the way
+        // repairIncompleteTail truncates the local file.
+        var base = existing;
+        if (base.len > 0 and base[base.len - 1] != '\n') {
+            if (std.mem.lastIndexOfScalar(u8, base, '\n')) |newline| {
+                base = base[0 .. newline + 1];
+            } else {
+                base = base[0..0];
+            }
+        }
+
+        const ctx: ByteSource.BytesContext = .{ .bytes = base };
+        const latest = try self.loadRecentFromSource(
+            alloc,
+            ByteSource.fromBytes(&ctx),
+            workspace_root,
+            1,
+            base.len,
+        );
+        defer freeLoadedEntries(alloc, latest);
+        if (latest.len == 1 and std.mem.eql(u8, latest[0].text, text)) {
+            return .duplicate;
+        }
+
+        const combined = try alloc.alloc(u8, base.len + line.len);
+        defer alloc.free(combined);
+        @memcpy(combined[0..base.len], base);
+        @memcpy(combined[base.len..], line);
+
+        var final = combined;
+        var compacted: ?[]u8 = null;
+        defer if (compacted) |c| alloc.free(c);
+        if (combined.len > compaction_threshold_bytes) {
+            const combined_ctx: ByteSource.BytesContext = .{ .bytes = combined };
+            compacted = compactRecords(
+                alloc,
+                ByteSource.fromBytes(&combined_ctx),
+                combined.len,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+            if (compacted) |c| final = c;
+        }
+        try store.writeSurface(alloc, history_file, final);
+        return .appended;
+    }
+
     fn compact(self: *Store, alloc: Allocator) !void {
         if (self.fail_compaction_before_rename) {
             return error.PromptHistoryCompactionStale;
@@ -341,7 +525,7 @@ pub const Store = struct {
         var file = (try self.openHistory(false, false)) orelse return;
         defer file.close(io_mod.getIo());
         const length = try file.length(io_mod.getIo());
-        const replacement = try compactRecords(alloc, file, length);
+        const replacement = try compactRecords(alloc, ByteSource.fromFile(&file), length);
         defer alloc.free(replacement);
 
         io_mod.durableReplaceVerified(
@@ -369,35 +553,31 @@ pub const Store = struct {
         var file = (try self.openHistory(false, false)) orelse
             return alloc.alloc(LoadedPromptHistoryEntry, 0);
         defer file.close(io_mod.getIo());
-        return self.loadRecentFromFile(
+        return self.loadRecentFromSource(
             alloc,
-            file,
+            ByteSource.fromFile(&file),
             workspace_root,
             limit,
             boundary,
         );
     }
 
-    fn loadRecentFromFile(
+    fn loadRecentFromSource(
         self: *Store,
         alloc: Allocator,
-        file: std.Io.File,
+        source: ByteSource,
         workspace_root: []const u8,
         limit: usize,
         requested_boundary: u64,
     ) ![]LoadedPromptHistoryEntry {
-        const length = try file.length(io_mod.getIo());
+        const length = try source.len();
         const boundary = @min(length, requested_boundary);
         if (boundary == 0 or limit == 0) {
             return alloc.alloc(LoadedPromptHistoryEntry, 0);
         }
 
         var last: [1]u8 = undefined;
-        const last_count = try file.readPositionalAll(
-            io_mod.getIo(),
-            &last,
-            boundary - 1,
-        );
+        const last_count = try source.readAt(&last, boundary - 1);
         var ignore_incomplete_tail = last_count != 1 or last[0] != '\n';
         var entries: std.ArrayList(LoadedPromptHistoryEntry) = .empty;
         errdefer {
@@ -418,11 +598,7 @@ pub const Store = struct {
             const block_len: usize = @intCast(block_len_u64);
             const block = try alloc.alloc(u8, block_len);
             defer alloc.free(block);
-            const count = try file.readPositionalAll(
-                io_mod.getIo(),
-                block,
-                start,
-            );
+            const count = try source.readAt(block, start);
             if (count != block_len) return error.PromptHistoryWriteFailed;
 
             var segment_end = count;
@@ -510,9 +686,10 @@ pub const Store = struct {
         var file = (try self.openHistory(false, false)) orelse return 0;
         defer file.close(io_mod.getIo());
         const length = try file.length(io_mod.getIo());
+        const source = ByteSource.fromFile(&file);
         var offset: u64 = 0;
         var count: usize = 0;
-        while (try readLineAt(std.testing.allocator, file, offset, length)) |line| {
+        while (try readLineAt(std.testing.allocator, source, offset, length)) |line| {
             defer std.testing.allocator.free(line.bytes);
             offset = line.next_offset;
             var record = parseRecord(std.testing.allocator, line.bytes[0 .. line.bytes.len - 1]) catch continue;
@@ -719,7 +896,7 @@ fn repairIncompleteTail(file: std.Io.File) !void {
 
 fn readLineAt(
     alloc: Allocator,
-    file: std.Io.File,
+    source: ByteSource,
     offset: u64,
     max_end: u64,
 ) !?LineRead {
@@ -733,11 +910,7 @@ fn readLineAt(
             @as(u64, chunk.len),
             max_end - cursor,
         ));
-        const count = try file.readPositionalAll(
-            io_mod.getIo(),
-            chunk[0..limit],
-            cursor,
-        );
+        const count = try source.readAt(chunk[0..limit], cursor);
         if (count == 0) return null;
         if (std.mem.findScalar(u8, chunk[0..count], '\n')) |newline| {
             try line.appendSlice(alloc, chunk[0 .. newline + 1]);
@@ -761,11 +934,7 @@ fn readLineAt(
                     @as(u64, chunk.len),
                     max_end - cursor,
                 ));
-                const skip_count = try file.readPositionalAll(
-                    io_mod.getIo(),
-                    chunk[0..skip_limit],
-                    cursor,
-                );
+                const skip_count = try source.readAt(chunk[0..skip_limit], cursor);
                 if (skip_count == 0) return null;
                 if (std.mem.findScalar(u8, chunk[0..skip_count], '\n')) |newline| {
                     cursor += newline + 1;
@@ -784,7 +953,7 @@ fn readLineAt(
 
 fn compactRecords(
     alloc: Allocator,
-    file: std.Io.File,
+    source: ByteSource,
     length: u64,
 ) ![]u8 {
     var retained: std.ArrayList([]u8) = .empty;
@@ -794,7 +963,7 @@ fn compactRecords(
     }
     var retained_bytes: usize = 0;
     var offset: u64 = 0;
-    while (try readLineAt(alloc, file, offset, length)) |line| {
+    while (try readLineAt(alloc, source, offset, length)) |line| {
         defer alloc.free(line.bytes);
         offset = line.next_offset;
         if (line.bytes.len == 0 or line.bytes.len > max_record_bytes or
@@ -837,14 +1006,14 @@ fn compactRecords(
 
 fn filterOtherWorkspaceRecords(
     alloc: Allocator,
-    file: std.Io.File,
+    source: ByteSource,
     length: u64,
     workspace_root: []const u8,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var offset: u64 = 0;
-    while (try readLineAt(alloc, file, offset, length)) |line| {
+    while (try readLineAt(alloc, source, offset, length)) |line| {
         defer alloc.free(line.bytes);
         offset = line.next_offset;
         if (line.bytes.len == 0 or line.bytes.len > max_record_bytes or
@@ -1427,4 +1596,136 @@ test "symlinked durable home is rejected before prompt history reads or writes" 
     defer alloc.free(home);
 
     try std.testing.expectError(error.DurablePathUnsafe, Store.initFromHome(alloc, home));
+}
+
+// A minimal in-memory backend standing in for the passport backend: every
+// surface is a key→bytes map.
+const RemoteHistoryBackend = struct {
+    entries: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *RemoteHistoryBackend, alloc: Allocator) void {
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            alloc.free(@constCast(kv.key_ptr.*));
+            alloc.free(kv.value_ptr.*);
+        }
+        self.entries.deinit(alloc);
+    }
+
+    fn backend(self: *RemoteHistoryBackend) store_redirect.Backend {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: store_redirect.Backend.VTable = .{
+        .read = readImpl,
+        .write = writeImpl,
+        .delete = deleteImpl,
+        .list = listImpl,
+    };
+
+    fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!?[]u8 {
+        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
+        const value = self.entries.get(key) orelse return null;
+        return try alloc.dupe(u8, value);
+    }
+
+    fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) store_redirect.BackendError!void {
+        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
+        if (self.entries.fetchRemove(key)) |kv| {
+            alloc.free(@constCast(kv.key));
+            alloc.free(kv.value);
+        }
+        try self.entries.put(alloc, try alloc.dupe(u8, key), try alloc.dupe(u8, bytes));
+    }
+
+    fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) store_redirect.BackendError!void {
+        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
+        if (self.entries.fetchRemove(key)) |kv| {
+            alloc.free(@constCast(kv.key));
+            alloc.free(kv.value);
+        }
+    }
+
+    fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) store_redirect.BackendError![][]u8 {
+        const self: *RemoteHistoryBackend = @ptrCast(@alignCast(ptr));
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |s| alloc.free(s);
+            out.deinit(alloc);
+        }
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) {
+                try out.append(alloc, try alloc.dupe(u8, kv.key_ptr.*));
+            }
+        }
+        return out.toOwnedSlice(alloc);
+    }
+};
+
+test "passport-backed history appends dedupes loads and clears remotely" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var mock = RemoteHistoryBackend{};
+    defer mock.deinit(alloc);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    // Inject the remote backend the way openPassportStore does.
+    const backend_store = try alloc.create(store_redirect.Store);
+    backend_store.* = try store_redirect.Store.init(alloc, home, mock.backend());
+    store.passport = backend_store;
+
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 1, "/tmp/workspace-a", "first"),
+    );
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 2, "/tmp/workspace-b", "other"),
+    );
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 3, "/tmp/workspace-a", "second"),
+    );
+    // An exact repeat of the newest record for the workspace dedupes.
+    try std.testing.expectEqual(
+        AppendOutcome.duplicate,
+        try store.append(alloc, 4, "/tmp/workspace-a", "second"),
+    );
+
+    // The document lives under the remote surface; nothing was written to
+    // the local durable home.
+    try std.testing.expect(mock.entries.get("config/history.jsonl") != null);
+    var durable_home = tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (durable_home) |*dir| {
+        defer dir.close(io_mod.getIo());
+        try std.testing.expectError(
+            error.FileNotFound,
+            dir.statFile(io_mod.getIo(), history_file, .{}),
+        );
+    }
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 10);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("first", entries[0].text);
+    try std.testing.expectEqualStrings("second", entries[1].text);
+
+    try store.clearWorkspace(alloc, "/tmp/workspace-a");
+    const cleared = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 10);
+    defer freeLoadedEntries(alloc, cleared);
+    try std.testing.expectEqual(@as(usize, 0), cleared.len);
+    const kept = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-b", 10);
+    defer freeLoadedEntries(alloc, kept);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("other", kept[0].text);
 }

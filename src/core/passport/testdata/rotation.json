@@ -1,0 +1,13 @@
+{
+  "specVersion": "passport-spec/0.1",
+  "attestation": {
+    "genesisDid": "did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
+    "newDid": "did:key:z6MkjsHJ27VECNVM394DimiaZpUzitPHA63iRWLVhj4yxdnN",
+    "seq": 1,
+    "prevHash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "sig": "ta/eQx3H4G2TngKiOa2hv4iLGqmXcR3oWAfR8mzcjn9rt1GNTyODh3ey8OD5wQyiR7iD0fe21a0Wj5zSTdRVAw=="
+  },
+  "attestationHash": "5169dc640246b0b1de89c45f5a3e2d73fee978b4b8fa86d70974553f9cbda57e",
+  "genesisDid": "did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
+  "successorDid": "did:key:z6MkjsHJ27VECNVM394DimiaZpUzitPHA63iRWLVhj4yxdnN"
+}
