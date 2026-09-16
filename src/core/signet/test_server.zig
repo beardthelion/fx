@@ -1,4 +1,4 @@
-//! In-process passport server and backend shims for the wire-level tests.
+//! In-process signet server and backend shims for the wire-level tests.
 //! Only test builds pull this file in: every importer references it from
 //! inside a test block.
 
@@ -14,7 +14,7 @@ const Allocator = std.mem.Allocator;
 /// entry map. The client must fail closed on every divergence.
 pub const ViewTamper = enum { none, extra_key, drop_key, wrong_hash };
 
-/// A minimal passport server speaking the wire contract: challenge/verify
+/// A minimal signet server speaking the wire contract: challenge/verify
 /// auth, ?view=hashes, ?view=integrity, PUT commits, and per-entry GETs.
 /// Entries are ciphertext blobs keyed by entry key; the manifest blob
 /// rides under client_mod.manifest_entry_key like a real entry.
@@ -155,12 +155,12 @@ pub const Server = struct {
         return reply(alloc, 200, body);
     }
 
-    /// Entry GET: /passport/<enc_ns>/<key...>. Test keys carry no
+    /// Entry GET: /signet/<enc_ns>/<key...>. Test keys carry no
     /// percent-escaped characters, so the literal suffix is the key.
     fn getReply(self: *Server, alloc: Allocator, path: []const u8) !client_mod.Response {
-        const rest = std.mem.indexOf(u8, path, "/passport/") orelse
+        const rest = std.mem.indexOf(u8, path, "/signet/") orelse
             return reply(alloc, 404, "{\"error\":{\"code\":\"entry_not_found\"}}");
-        const after_ns = std.mem.indexOfScalarPos(u8, path, rest + "/passport/".len, '/') orelse
+        const after_ns = std.mem.indexOfScalarPos(u8, path, rest + "/signet/".len, '/') orelse
             return reply(alloc, 404, "{\"error\":{\"code\":\"entry_not_found\"}}");
         const key = path[after_ns + 1 ..];
         const blob = self.entries.get(key) orelse
@@ -288,8 +288,8 @@ pub fn signedManifestBlob(
 }
 
 /// A Backend wrapper that fails the first `stale_writes_left` writes with
-/// error.PassportStaleBase and the first `fail_reads_left` reads with
-/// error.PassportUnavailable before delegating to `inner`. Lets a test
+/// error.SignetStaleBase and the first `fail_reads_left` reads with
+/// error.SignetUnavailable before delegating to `inner`. Lets a test
 /// drive every bounded read->merge->write retry loop through the real
 /// Store surface calls.
 pub const FlakyBackend = struct {
@@ -317,7 +317,7 @@ pub const FlakyBackend = struct {
         self.read_calls += 1;
         if (self.fail_reads_left > 0) {
             self.fail_reads_left -= 1;
-            return error.PassportUnavailable;
+            return error.SignetUnavailable;
         }
         return self.inner.read(alloc, key);
     }
@@ -327,7 +327,7 @@ pub const FlakyBackend = struct {
         self.write_calls += 1;
         if (self.stale_writes_left > 0) {
             self.stale_writes_left -= 1;
-            return error.PassportStaleBase;
+            return error.SignetStaleBase;
         }
         return self.inner.write(alloc, key, bytes);
     }

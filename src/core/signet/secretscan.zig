@@ -1,13 +1,13 @@
 //! Client-side secret scanner — defense in depth (PS-110).
 //!
-//! A passport carries an agent's whole working state, and agents are
+//! A signet carries an agent's whole working state, and agents are
 //! excellent at accidentally writing "the API key is sk-..." into a note.
 //! Everything is encrypted before upload, but a synced secret is still a
 //! synced secret. So every entry — session chunks included — is scanned
 //! here, on the client, BEFORE encryption, and (by default) refused if it
 //! looks like it carries a live credential.
 //!
-//! Ported from passport-suite src/client/secretscan.ts. Zig has no regex
+//! Ported from signet-suite src/client/secretscan.ts. Zig has no regex
 //! engine, so each rule is a hand-written matcher with the same
 //! block/pass semantics as the reference regexes (word boundaries, greedy
 //! runs, and the trailing \b backtracking the reference engine performs).

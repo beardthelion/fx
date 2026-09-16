@@ -9,7 +9,7 @@ const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
-const store_redirect = @import("../passport/store_redirect.zig");
+const store_redirect = @import("../signet/store_redirect.zig");
 const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
@@ -316,33 +316,33 @@ pub const Store = struct {
     fail_parent_sync_after_rename: bool = false,
     fail_migration_snapshot: bool = false,
     last_failure_cleanup: LegacyCleanup = .{},
-    /// Live when the passport backend is enabled; owned. The primary
+    /// Live when the signet backend is enabled; owned. The primary
     /// settings document routes through it while backups stay local.
-    passport: ?*store_redirect.Store = null,
+    signet: ?*store_redirect.Store = null,
 
     fn initReadOnlyAbsent(
         alloc: Allocator,
         home_path: []const u8,
-        passport: ?*store_redirect.Store,
+        signet: ?*store_redirect.Store,
     ) !Store {
         return .{
             .durable_home = null,
             .display_root = try profile_paths.rootDir(alloc, home_path),
             .availability = .read_only_absent,
             .mode = .read_only,
-            .passport = passport,
+            .signet = signet,
         };
     }
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode) !Store {
         // Misconfigured enabled state propagates rather than silently
         // falling back to local settings.
-        const passport = try store_redirect.openEnabled(alloc, home_path);
-        errdefer if (passport) |p| store_redirect.destroyOwned(p);
+        const signet = try store_redirect.openEnabled(alloc, home_path);
+        errdefer if (signet) |p| store_redirect.destroyOwned(p);
         const zio = io_mod.getIo();
         var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
-                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path, passport);
+                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path, signet);
                 return err;
             },
             else => return err,
@@ -354,7 +354,7 @@ pub const Store = struct {
             .follow_symlinks = false,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
-                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path, passport);
+                if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path, signet);
 
                 var verified_home = io_mod.VerifiedDir{
                     .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }),
@@ -388,13 +388,13 @@ pub const Store = struct {
             .display_root = try io_mod.dirRealpathAlloc(alloc, durable_home, "."),
             .availability = .writable,
             .mode = mode,
-            .passport = passport,
+            .signet = signet,
         };
     }
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
         self.last_failure_cleanup.deinit(alloc);
-        if (self.passport) |p| store_redirect.destroyOwned(p);
+        if (self.signet) |p| store_redirect.destroyOwned(p);
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.display_root);
         self.* = undefined;
@@ -481,7 +481,7 @@ pub const Store = struct {
         mutation_mode: []const u8,
     ) !CommitOutcome {
         if (self.mode != .writable or
-            (self.durable_home == null and self.passport == null))
+            (self.durable_home == null and self.signet == null))
         {
             return error.SettingsStoreUnavailable;
         }
@@ -496,7 +496,7 @@ pub const Store = struct {
         }
 
         // The advisory lock guards the local document and backups; in
-        // passport mode the primary lives remotely and the backend's
+        // signet mode the primary lives remotely and the backend's
         // manifest transaction is the concurrency boundary.
         var lock: ?io_mod.TimedAdvisoryLock = null;
         if (self.durable_home) |*durable| {
@@ -586,13 +586,13 @@ pub const Store = struct {
             const precommit_fingerprint = fingerprintOptional(precommit_bytes);
             if (!std.mem.eql(u8, &original_fingerprint, &precommit_fingerprint)) continue;
 
-            if (self.passport) |passport_store| {
-                passport_store.writeSurface(alloc, "settings.json", candidate) catch |err| switch (err) {
+            if (self.signet) |signet_store| {
+                signet_store.writeSurface(alloc, "settings.json", candidate) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     // Stale base: the remote moved under the cycle, so
                     // re-read and re-merge inside the bounded loop
                     // instead of committing against a stale read.
-                    error.PassportStaleBase => continue,
+                    error.SignetStaleBase => continue,
                     else => return error.SettingsCommitFailed,
                 };
             } else {
@@ -740,7 +740,7 @@ pub const Store = struct {
     }
 
     fn loadRawPrimary(self: *Store, alloc: Allocator) !RawPrimary {
-        if (self.passport) |store| {
+        if (self.signet) |store| {
             const remote = try store.readSurface(alloc, "settings.json");
             if (remote) |bytes| {
                 if (bytes.len > max_settings_bytes) {
@@ -4074,9 +4074,9 @@ test "workspace directory add compacts saved aliases before applying effective c
     try std.testing.expectEqualStrings(added, directories[1].string);
 }
 
-const test_server = @import("../passport/test_server.zig");
+const test_server = @import("../signet/test_server.zig");
 
-test "passport-backed mutation retries a stale base and still commits" {
+test "signet-backed mutation retries a stale base and still commits" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4088,7 +4088,7 @@ test "passport-backed mutation retries a stale base and still commits" {
 
     var mock = store_redirect.MockBackend{};
     defer mock.deinit(alloc);
-    // The first writeSurface answers PassportStaleBase; the bounded loop
+    // The first writeSurface answers SignetStaleBase; the bounded loop
     // re-reads the primary and re-merges instead of committing stale.
     var flaky = test_server.FlakyBackend{
         .inner = mock.backend(),
@@ -4099,7 +4099,7 @@ test "passport-backed mutation retries a stale base and still commits" {
     defer store.deinit(alloc);
     const backend_store = try alloc.create(store_redirect.Store);
     backend_store.* = try store_redirect.Store.init(alloc, home, flaky.backend());
-    store.passport = backend_store;
+    store.signet = backend_store;
 
     var outcome = try store.applyUserPatch(alloc, .{ .fast_mode = true });
     defer outcome.deinit(alloc);

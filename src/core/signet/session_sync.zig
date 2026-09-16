@@ -1,6 +1,6 @@
 //! Session mirroring between the local session log directory and the
-//! passport store. The local directory remains the canonical record:
-//! commits mirror best-effort into passport entries, and a missing local
+//! signet store. The local directory remains the canonical record:
+//! commits mirror best-effort into signet entries, and a missing local
 //! directory is hydrated from the mirror when a session is opened by id.
 //!
 //! Remote layout conforms to the sessions key grammar (PS-020/PS-022):
@@ -40,7 +40,7 @@ const events_file = "events.jsonl";
 /// The index entry always sits at seq 0.
 const index_seq: u64 = 0;
 
-/// Session-dir members mirrored into the passport. Everything else under
+/// Session-dir members mirrored into the signet. Everything else under
 /// the session directory stays local.
 fn isMirroredFile(name: []const u8) bool {
     if (std.mem.eql(u8, name, events_file)) return true;
@@ -137,13 +137,13 @@ fn parseIndex(alloc: Allocator, bytes: []const u8) !ParsedIndex {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     const root = parsed.value;
-    if (root != .object) return error.PassportMirrorCorrupt;
-    const v = root.object.get("v") orelse return error.PassportMirrorCorrupt;
-    if (v != .integer or v.integer != 2) return error.PassportMirrorCorrupt;
+    if (root != .object) return error.SignetMirrorCorrupt;
+    const v = root.object.get("v") orelse return error.SignetMirrorCorrupt;
+    if (v != .integer or v.integer != 2) return error.SignetMirrorCorrupt;
 
-    const files_v = root.object.get("files") orelse return error.PassportMirrorCorrupt;
-    if (files_v != .array) return error.PassportMirrorCorrupt;
-    if (files_v.array.items.len > max_mirrored_files) return error.PassportMirrorCorrupt;
+    const files_v = root.object.get("files") orelse return error.SignetMirrorCorrupt;
+    if (files_v != .array) return error.SignetMirrorCorrupt;
+    if (files_v.array.items.len > max_mirrored_files) return error.SignetMirrorCorrupt;
 
     var files: std.ArrayList(ParsedIndex.ParsedFile) = .empty;
     errdefer {
@@ -154,33 +154,33 @@ fn parseIndex(alloc: Allocator, bytes: []const u8) !ParsedIndex {
         files.deinit(alloc);
     }
     for (files_v.array.items) |item| {
-        if (item != .object) return error.PassportMirrorCorrupt;
-        const name_v = item.object.get("name") orelse return error.PassportMirrorCorrupt;
-        const first_v = item.object.get("first") orelse return error.PassportMirrorCorrupt;
-        const chunks_v = item.object.get("chunks") orelse return error.PassportMirrorCorrupt;
-        const bytes_v = item.object.get("bytes") orelse return error.PassportMirrorCorrupt;
-        const sha_v = item.object.get("sha256") orelse return error.PassportMirrorCorrupt;
+        if (item != .object) return error.SignetMirrorCorrupt;
+        const name_v = item.object.get("name") orelse return error.SignetMirrorCorrupt;
+        const first_v = item.object.get("first") orelse return error.SignetMirrorCorrupt;
+        const chunks_v = item.object.get("chunks") orelse return error.SignetMirrorCorrupt;
+        const bytes_v = item.object.get("bytes") orelse return error.SignetMirrorCorrupt;
+        const sha_v = item.object.get("sha256") orelse return error.SignetMirrorCorrupt;
         if (name_v != .string or !isMirroredFile(name_v.string))
-            return error.PassportMirrorCorrupt;
+            return error.SignetMirrorCorrupt;
         if (first_v != .integer or first_v.integer <= 0)
-            return error.PassportMirrorCorrupt;
+            return error.SignetMirrorCorrupt;
         if (chunks_v != .integer or chunks_v.integer < 0)
-            return error.PassportMirrorCorrupt;
+            return error.SignetMirrorCorrupt;
         if (bytes_v != .integer or bytes_v.integer < 0)
-            return error.PassportMirrorCorrupt;
+            return error.SignetMirrorCorrupt;
         if (sha_v != .string or sha_v.string.len != 64)
-            return error.PassportMirrorCorrupt;
+            return error.SignetMirrorCorrupt;
         const name = name_v.string;
         const file_bytes: u64 = @intCast(bytes_v.integer);
         const cap: u64 = if (std.mem.eql(u8, name, events_file))
             max_events_bytes
         else
             max_meta_file_bytes;
-        if (file_bytes > cap) return error.PassportMirrorCorrupt;
+        if (file_bytes > cap) return error.SignetMirrorCorrupt;
         const file_chunks: u64 = @intCast(chunks_v.integer);
-        if (file_chunks != chunksFor(file_bytes)) return error.PassportMirrorCorrupt;
+        if (file_chunks != chunksFor(file_bytes)) return error.SignetMirrorCorrupt;
         const first: u64 = @intCast(first_v.integer);
-        if (first + file_chunks < first) return error.PassportMirrorCorrupt;
+        if (first + file_chunks < first) return error.SignetMirrorCorrupt;
         try files.append(alloc, .{
             .name = try alloc.dupe(u8, name),
             .first = first,
@@ -195,9 +195,9 @@ fn parseIndex(alloc: Allocator, bytes: []const u8) !ParsedIndex {
             const a_end = a.first + a.chunks;
             const b_end = b.first + b.chunks;
             if (a.first < b_end and b.first < a_end)
-                return error.PassportMirrorCorrupt;
+                return error.SignetMirrorCorrupt;
             if (std.mem.eql(u8, a.name, b.name))
-                return error.PassportMirrorCorrupt;
+                return error.SignetMirrorCorrupt;
         }
     }
     return .{ .files = try files.toOwnedSlice(alloc) };
@@ -220,12 +220,12 @@ fn readBounded(
     };
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.size > max_bytes) return error.PassportMirrorCorrupt;
+    if (stat.kind != .file or stat.size > max_bytes) return error.SignetMirrorCorrupt;
     return try io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
 /// Push the current contents of a local session directory into the
-/// passport store. Callers treat failures as advisory: the local commit
+/// signet store. Callers treat failures as advisory: the local commit
 /// already landed, so a mirror failure must not fail the write path.
 pub fn mirrorSession(
     alloc: Allocator,
@@ -234,7 +234,7 @@ pub fn mirrorSession(
     session_id: []const u8,
 ) !void {
     try session_layout.validateSessionId(session_id);
-    if (!sessionIdRemoteable(session_id)) return error.PassportUnavailable;
+    if (!sessionIdRemoteable(session_id)) return error.SignetUnavailable;
     const zio = io_mod.getIo();
 
     var rel_paths: std.ArrayList([]const u8) = .empty;
@@ -257,7 +257,7 @@ pub fn mirrorSession(
         names.deinit(alloc);
     }
     var it = session_dir.dir.iterate();
-    while (it.next(zio) catch return error.PassportUnavailable) |entry| {
+    while (it.next(zio) catch return error.SignetUnavailable) |entry| {
         if (entry.kind != .file) continue;
         const name = entry.name;
         if (!isMirroredFile(name)) continue;
@@ -276,7 +276,7 @@ pub fn mirrorSession(
             return std.mem.lessThan(u8, a, b);
         }
     }.lessThan);
-    if (names.items.len > max_mirrored_files) return error.PassportMirrorCorrupt;
+    if (names.items.len > max_mirrored_files) return error.SignetMirrorCorrupt;
 
     // The prior mirror index: a file whose sha256 and chunk layout match
     // its previous record is already remote under the same seqs, so its
@@ -416,7 +416,7 @@ pub fn mirrorSession(
     }
 }
 
-/// Materialize a passport-mirrored session into the local sessions
+/// Materialize a signet-mirrored session into the local sessions
 /// directory. Returns false when no mirror exists. Any mirror that
 /// parses but fails its own integrity statement is an error, never a
 /// silent partial restore.
@@ -433,7 +433,7 @@ pub fn hydrateSession(
     defer alloc.free(index_rel);
     const index_bytes = (try store.readSurface(alloc, index_rel)) orelse return false;
     defer alloc.free(index_bytes);
-    if (index_bytes.len > max_index_bytes) return error.PassportMirrorCorrupt;
+    if (index_bytes.len > max_index_bytes) return error.SignetMirrorCorrupt;
     var index = try parseIndex(alloc, index_bytes);
     defer index.deinit(alloc);
 
@@ -477,16 +477,16 @@ pub fn hydrateSession(
         var seq: u64 = 0;
         while (seq < f.chunks) : (seq += 1) {
             const chunk = chunks[chunk_cursor] orelse
-                return error.PassportMirrorCorrupt;
+                return error.SignetMirrorCorrupt;
             chunk_cursor += 1;
-            if (written + chunk.len > buf.len) return error.PassportMirrorCorrupt;
+            if (written + chunk.len > buf.len) return error.SignetMirrorCorrupt;
             @memcpy(buf[written .. written + chunk.len], chunk);
             written += chunk.len;
         }
-        if (written != buf.len) return error.PassportMirrorCorrupt;
+        if (written != buf.len) return error.SignetMirrorCorrupt;
         const digest = try identity.sha256Hex(alloc, buf);
         defer alloc.free(digest);
-        if (!std.mem.eql(u8, digest, f.sha256)) return error.PassportMirrorCorrupt;
+        if (!std.mem.eql(u8, digest, f.sha256)) return error.SignetMirrorCorrupt;
         try contents.append(alloc, .{ .name = f.name, .bytes = buf });
     }
 
@@ -516,7 +516,7 @@ pub fn hydrateSession(
     return true;
 }
 
-/// Delete every passport entry under `sessions/<id>/`. Absent is fine.
+/// Delete every signet entry under `sessions/<id>/`. Absent is fine.
 pub fn deleteSession(
     alloc: Allocator,
     store: *store_redirect.Store,
@@ -671,7 +671,7 @@ test "hydrate rejects a torn mirror" {
     var sessions_vd = try io_mod.openOrCreateVerifiedPrivateDir(&home_vd, "sessions");
     defer sessions_vd.close();
     try testing.expectError(
-        error.PassportMirrorCorrupt,
+        error.SignetMirrorCorrupt,
         hydrateSession(alloc, &store, &sessions_vd, "s1"),
     );
 }

@@ -1,5 +1,5 @@
-//! Redirect layer: when the passport backend is enabled, the enumerated
-//! ~/.fx state surfaces read and write through the passport instead of the
+//! Redirect layer: when the signet backend is enabled, the enumerated
+//! ~/.fx state surfaces read and write through the signet instead of the
 //! filesystem. When it is disabled, every operation lands on the exact same
 //! local file with the exact same IO helpers — byte-for-byte unchanged.
 //!
@@ -39,23 +39,23 @@ const max_surface_bytes: usize = 64 * 1024 * 1024;
 const Route = union(enum) {
     /// Stays on the filesystem under ~/.fx.
     local,
-    /// A passport entry key (owned by the caller's allocator).
-    passport: []u8,
+    /// A signet entry key (owned by the caller's allocator).
+    signet: []u8,
 };
 
 /// Map a profile-relative path (forward slashes, relative to ~/.fx) to its
 /// storage route. Unroutable or unlisted paths stay local — a surface that
 /// cannot map to a valid entry key is never silently pushed into the
-/// passport.
+/// signet.
 fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
     if (std.mem.eql(u8, rel_path, "settings.json"))
-        return .{ .passport = try alloc.dupe(u8, "config/settings.json") };
+        return .{ .signet = try alloc.dupe(u8, "config/settings.json") };
     if (std.mem.eql(u8, rel_path, "memories.json"))
-        return .{ .passport = try alloc.dupe(u8, "memory/memories.json") };
+        return .{ .signet = try alloc.dupe(u8, "memory/memories.json") };
     if (std.mem.eql(u8, rel_path, "history.jsonl"))
-        return .{ .passport = try alloc.dupe(u8, "config/history.jsonl") };
+        return .{ .signet = try alloc.dupe(u8, "config/history.jsonl") };
     if (std.mem.eql(u8, rel_path, "mcp.json"))
-        return .{ .passport = try alloc.dupe(u8, "config/mcp.json") };
+        return .{ .signet = try alloc.dupe(u8, "config/mcp.json") };
     if (std.mem.startsWith(u8, rel_path, "sessions/")) {
         const rest = rel_path["sessions/".len..];
         // sessions/latest/ is the local resume cache, never a session.
@@ -65,16 +65,16 @@ fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
         // Anything else under sessions/ stays local rather than emitting
         // an entry key the store would reject.
         if (!client_mod.isValidEntryKey(rel_path)) return .local;
-        return .{ .passport = try alloc.dupe(u8, rel_path) };
+        return .{ .signet = try alloc.dupe(u8, rel_path) };
     }
     if (std.mem.startsWith(u8, rel_path, "grants/")) {
         if (!client_mod.isValidEntryKey(rel_path)) return .local;
-        return .{ .passport = try alloc.dupe(u8, rel_path) };
+        return .{ .signet = try alloc.dupe(u8, rel_path) };
     }
     if (std.mem.startsWith(u8, rel_path, "memory/")) {
         // Learned entries live under memory/<type>/<slug>.md (KTD8).
         if (!client_mod.isValidEntryKey(rel_path)) return .local;
-        return .{ .passport = try alloc.dupe(u8, rel_path) };
+        return .{ .signet = try alloc.dupe(u8, rel_path) };
     }
     return .local;
 }
@@ -83,12 +83,12 @@ fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
 
 pub const BackendError = error{
     InvalidEntryKey,
-    PassportUnavailable,
+    SignetUnavailable,
     OutOfMemory,
 } || client_mod.Error;
 
 /// The narrow interface the stores call. The production implementation
-/// is PassportBackend (encrypted remote); the disabled path uses the
+/// is SignetBackend (encrypted remote); the disabled path uses the
 /// localRead/localWrite/localDelete free functions directly. Tests
 /// substitute their own.
 pub const Backend = struct {
@@ -107,7 +107,7 @@ pub const Backend = struct {
         list: *const fn (ptr: *anyopaque, alloc: Allocator, prefix: []const u8) BackendError![][]u8,
         /// Optional batched read: results[i] answers keys[i], null when
         /// absent. Caller owns the slice and each non-null element. When
-        /// null the Store falls back to per-entry reads. The passport
+        /// null the Store falls back to per-entry reads. The signet
         /// backend verifies the manifest once for the whole batch.
         read_batch: ?*const fn (
             ptr: *anyopaque,
@@ -115,7 +115,7 @@ pub const Backend = struct {
             keys: []const []const u8,
         ) BackendError![]?[]u8 = null,
         /// Optional batched write: keys[i] receives plaintexts[i]. When null
-        /// the Store falls back to per-entry writes. The passport backend
+        /// the Store falls back to per-entry writes. The signet backend
         /// uses one manifest transaction for the whole batch.
         write_batch: ?*const fn (
             ptr: *anyopaque,
@@ -198,22 +198,22 @@ pub const Backend = struct {
 fn localRead(alloc: Allocator, path: []const u8) BackendError!?[]u8 {
     var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return error.PassportUnavailable,
+        else => return error.SignetUnavailable,
     };
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, max_surface_bytes) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.PassportUnavailable,
+        else => error.SignetUnavailable,
     };
 }
 
 fn localWrite(alloc: Allocator, path: []const u8, bytes: []const u8) BackendError!void {
     if (std.fs.path.dirname(path)) |dir_path| {
-        io_mod.makeDirRecursive(dir_path) catch return error.PassportUnavailable;
+        io_mod.makeDirRecursive(dir_path) catch return error.SignetUnavailable;
     }
     io_mod.writeFileAtomic(alloc, path, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.PassportUnavailable,
+        else => return error.SignetUnavailable,
     };
 }
 
@@ -230,11 +230,11 @@ fn localList(alloc: Allocator, dir_rel: []const u8, dir_path: []const u8) Backen
     const zio = io_mod.getIo();
     var dir = std.Io.Dir.openDirAbsolute(zio, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return try alloc.alloc([]u8, 0),
-        else => return error.PassportUnavailable,
+        else => return error.SignetUnavailable,
     };
     defer dir.close(zio);
 
-    var walker = dir.walk(alloc) catch return error.PassportUnavailable;
+    var walker = dir.walk(alloc) catch return error.SignetUnavailable;
     defer walker.deinit();
 
     var out: std.ArrayList([]u8) = .empty;
@@ -242,7 +242,7 @@ fn localList(alloc: Allocator, dir_rel: []const u8, dir_path: []const u8) Backen
         for (out.items) |s| alloc.free(s);
         out.deinit(alloc);
     }
-    while (walker.next(zio) catch return error.PassportUnavailable) |entry| {
+    while (walker.next(zio) catch return error.SignetUnavailable) |entry| {
         if (entry.kind != .file) continue;
         const rel = try std.fs.path.join(alloc, &.{ dir_rel, entry.path });
         // Normalize separators for the entry-key namespace.
@@ -252,12 +252,12 @@ fn localList(alloc: Allocator, dir_rel: []const u8, dir_path: []const u8) Backen
     return out.toOwnedSlice(alloc);
 }
 
-/// Passport-backed implementation: entries are secret-scanned, encrypted,
+/// Signet-backed implementation: entries are secret-scanned, encrypted,
 /// and pushed through the client (PS-030/032/033/110).
-pub const PassportBackend = struct {
+pub const SignetBackend = struct {
     client: *client_mod.Client,
 
-    pub fn backend(self: *PassportBackend) Backend {
+    pub fn backend(self: *SignetBackend) Backend {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -273,7 +273,7 @@ pub const PassportBackend = struct {
     };
 
     fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!?[]u8 {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         const bytes = self.client.readEntry(key) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
@@ -287,7 +287,7 @@ pub const PassportBackend = struct {
 
     /// One manifest fetch+verify covers the whole batch (PS-041).
     fn readBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError![]?[]u8 {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         return self.client.readEntries(alloc, keys);
     }
 
@@ -297,18 +297,18 @@ pub const PassportBackend = struct {
     const stale_base_max_attempts: u8 = 4;
 
     fn pushWithRetry(
-        self: *PassportBackend,
+        self: *SignetBackend,
         entries: []const client_mod.Entry,
         deletions: []const []const u8,
     ) client_mod.Error!client_mod.PushResult {
         var attempt: u8 = 1;
         while (true) {
             return self.client.push(entries, deletions) catch |err| switch (err) {
-                error.PassportStaleBase => {
+                error.SignetStaleBase => {
                     if (attempt >= stale_base_max_attempts)
-                        return error.PassportStaleBase;
+                        return error.SignetStaleBase;
                     debug_trace.logf(
-                        "passport",
+                        "signet",
                         "event=stale_base_retry attempt={d}",
                         .{attempt},
                     );
@@ -321,7 +321,7 @@ pub const PassportBackend = struct {
     }
 
     fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         _ = alloc;
         const entries = [_]client_mod.Entry{.{ .key = key, .plaintext = bytes }};
         var result = self.pushWithRetry(&entries, &.{}) catch |err| switch (err) {
@@ -334,7 +334,7 @@ pub const PassportBackend = struct {
     }
 
     fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!void {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         _ = alloc;
         const deletions = [_][]const u8{key};
         var result = self.pushWithRetry(&.{}, &deletions) catch |err| switch (err) {
@@ -349,7 +349,7 @@ pub const PassportBackend = struct {
     /// real file name, before the caller splits it into chunk entries
     /// that would each scan clean around a boundary-straddling secret.
     fn scanImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         if (self.client.scan_mode == .off) return;
         const entries = [_]secretscan.Entry{.{ .key = key, .text = bytes }};
         var findings: std.ArrayList(secretscan.Finding) = .empty;
@@ -370,7 +370,7 @@ pub const PassportBackend = struct {
         };
         for (findings.items) |f| {
             debug_trace.logf(
-                "passport",
+                "signet",
                 "event=secret_scan_{s} key={s} rule={s} line={d} match={s}",
                 .{ if (blocked) "block" else "warn", f.entry_key, f.rule, f.line, f.match },
             );
@@ -380,12 +380,12 @@ pub const PassportBackend = struct {
 
     /// Warn-mode secret scan reports into debug_trace so a committed
     /// credential shape is visible without blocking the write (PS-110).
-    fn traceWarnFindings(self: *PassportBackend) void {
+    fn traceWarnFindings(self: *SignetBackend) void {
         if (self.client.scan_mode != .warn) return;
         const findings = self.client.scanFindings() orelse return;
         for (findings) |f| {
             debug_trace.logf(
-                "passport",
+                "signet",
                 "event=secret_scan_warn key={s} rule={s} line={d} match={s}",
                 .{ f.entry_key, f.rule, f.line, f.match },
             );
@@ -393,7 +393,7 @@ pub const PassportBackend = struct {
     }
 
     fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) BackendError![][]u8 {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         const entries = self.client.hashes() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
@@ -427,7 +427,7 @@ pub const PassportBackend = struct {
         keys: []const []const u8,
         plaintexts: []const []const u8,
     ) BackendError!void {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         const entries = try alloc.alloc(client_mod.Entry, keys.len);
         defer alloc.free(entries);
         for (keys, plaintexts, 0..) |key, bytes, i| {
@@ -442,7 +442,7 @@ pub const PassportBackend = struct {
     }
 
     fn deleteBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError!void {
-        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         _ = alloc;
         var result = self.pushWithRetry(&.{}, keys) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -462,7 +462,7 @@ pub const Store = struct {
     home: []u8,
     cfg: ?config_mod.Config = null,
     // Heap-allocated so client.transport can point back into the transport
-    // and PassportBackend can point at the client without dangling when the
+    // and SignetBackend can point at the client without dangling when the
     // Store is returned by value.
     http: ?*client_mod.HttpTransport = null,
     client: ?*client_mod.Client = null,
@@ -475,7 +475,7 @@ pub const Store = struct {
     /// Verified rotation chain loaded at open. Kept alive because
     /// client.attestations borrows the slice.
     rotation_chain: []identity.RotationAttestation = &.{},
-    passport_backend: ?PassportBackend = null,
+    signet_backend: ?SignetBackend = null,
     injected_backend: ?Backend = null,
 
     /// Open the store for a home dir. Disabled (no config) yields a store
@@ -490,8 +490,8 @@ pub const Store = struct {
         store.cfg = try config_mod.resolve(alloc, home);
         if (store.cfg) |*cfg| {
             errdefer cfg.deinit(alloc);
-            const seed = cfg.seed orelse return error.PassportSecretsMissing;
-            const passphrase = cfg.passphrase orelse return error.PassportSecretsMissing;
+            const seed = cfg.seed orelse return error.SignetSecretsMissing;
+            const passphrase = cfg.passphrase orelse return error.SignetSecretsMissing;
             var id = try identity.identityFromSeed(alloc, seed);
             errdefer id.deinit(alloc);
 
@@ -501,9 +501,9 @@ pub const Store = struct {
                 // derived from — post-rotation the holder key and the
                 // namespace owner differ, so decoding the namespace is
                 // the only honest way to recover the chain anchor.
-                if (!identity.isValidNamespace(ns)) return error.PassportNamespaceInvalid;
+                if (!identity.isValidNamespace(ns)) return error.SignetNamespaceInvalid;
                 store.genesis_did = (try identity.didFromNamespace(alloc, ns)) orelse
-                    return error.PassportNamespaceInvalid;
+                    return error.SignetNamespaceInvalid;
                 genesis_did = store.genesis_did.?;
             }
 
@@ -511,7 +511,7 @@ pub const Store = struct {
             // client still enforces the seq floor (PS-041).
             const state_path = try std.fs.path.join(
                 alloc,
-                &.{ home, profile_paths.root_dir_name, "passport", "manifest-state.json" },
+                &.{ home, profile_paths.root_dir_name, "signet", "manifest-state.json" },
             );
             defer alloc.free(state_path);
             var state_seq: u64 = 0;
@@ -550,7 +550,7 @@ pub const Store = struct {
             store.identity = id;
 
             if (cfg.namespace != null) {
-                // A pinned namespace may point at a passport whose holder
+                // A pinned namespace may point at a signet whose holder
                 // rotated keys: rebuild and verify the chain, then adopt
                 // it for auth and manifest signer checks (PS-051/052).
                 store.rotation_chain = try store.client.?.loadRotationChain(alloc);
@@ -571,11 +571,11 @@ pub const Store = struct {
                 // genesis nor the current successor) is a misconfigured
                 // enabled state: fail closed, not local fallback.
                 if (!std.mem.eql(u8, current_did, id.did))
-                    return error.PassportNamespaceInvalid;
+                    return error.SignetNamespaceInvalid;
                 store.client.?.attestations = store.rotation_chain;
             }
 
-            store.passport_backend = .{ .client = store.client.? };
+            store.signet_backend = .{ .client = store.client.? };
         }
         return store;
     }
@@ -612,13 +612,13 @@ pub const Store = struct {
         self.* = undefined;
     }
 
-    /// Whether the passport backend is live.
-    pub fn passportEnabled(self: *const Store) bool {
+    /// Whether the signet backend is live.
+    pub fn signetEnabled(self: *const Store) bool {
         if (self.injected_backend != null) return true;
-        return self.passport_backend != null;
+        return self.signet_backend != null;
     }
 
-    /// The holder DID the passport client signs with, when the remote
+    /// The holder DID the signet client signs with, when the remote
     /// backend is live. Null on a local or injected-backend store.
     pub fn holderDid(self: *const Store) ?[]const u8 {
         const client = self.client orelse return null;
@@ -627,18 +627,18 @@ pub const Store = struct {
 
     fn activeBackend(self: *Store) ?Backend {
         if (self.injected_backend) |b| return b;
-        if (self.passport_backend) |*b| return b.backend();
+        if (self.signet_backend) |*b| return b.backend();
         return null;
     }
 
     /// Read a surface's bytes. Disabled or unrouted surfaces read the local
-    /// file; passport surfaces go through the backend.
+    /// file; signet surfaces go through the backend.
     pub fn readSurface(self: *Store, alloc: Allocator, rel_path: []const u8) BackendError!?[]u8 {
         if (self.activeBackend()) |b| {
             const route = try routePath(alloc, rel_path);
             switch (route) {
                 .local => {},
-                .passport => |key| {
+                .signet => |key| {
                     defer alloc.free(key);
                     return b.read(alloc, key);
                 },
@@ -650,7 +650,7 @@ pub const Store = struct {
     }
 
     /// Batched read: results[i] answers rel_paths[i]. Local-routed paths
-    /// keep the per-path file reads; passport-routed paths share one
+    /// keep the per-path file reads; signet-routed paths share one
     /// backend batch, which means one manifest fetch+verify. Caller owns
     /// the slice and each non-null element.
     pub fn readSurfacesBatch(
@@ -693,7 +693,7 @@ pub const Store = struct {
                     defer alloc.free(path);
                     results[i] = try localRead(alloc, path);
                 },
-                .passport => |key| {
+                .signet => |key| {
                     try remote_keys.append(alloc, key);
                     try remote_idx.append(alloc, i);
                 },
@@ -715,7 +715,7 @@ pub const Store = struct {
             const route = try routePath(alloc, rel_path);
             switch (route) {
                 .local => {},
-                .passport => |key| {
+                .signet => |key| {
                     defer alloc.free(key);
                     return b.write(alloc, key, bytes);
                 },
@@ -732,7 +732,7 @@ pub const Store = struct {
             const route = try routePath(alloc, rel_path);
             switch (route) {
                 .local => {},
-                .passport => |key| {
+                .signet => |key| {
                     defer alloc.free(key);
                     return b.delete(alloc, key);
                 },
@@ -740,10 +740,10 @@ pub const Store = struct {
         }
         const path = try std.fs.path.join(alloc, &.{ self.home, profile_paths.root_dir_name, rel_path });
         defer alloc.free(path);
-        localDelete(path) catch return error.PassportUnavailable;
+        localDelete(path) catch return error.SignetUnavailable;
     }
 
-    /// Batched surface write. Passport-routed paths go through one backend
+    /// Batched surface write. Signet-routed paths go through one backend
     /// transaction when the backend supports it; local-routed paths still
     /// hit the filesystem.
     pub fn writeSurfaces(
@@ -764,7 +764,7 @@ pub const Store = struct {
             for (rel_paths, plaintexts) |rel, bytes| {
                 const route = try routePath(alloc, rel);
                 switch (route) {
-                    .passport => |key| {
+                    .signet => |key| {
                         try keys.append(alloc, key);
                         try vals.append(alloc, bytes);
                     },
@@ -799,14 +799,14 @@ pub const Store = struct {
             for (rel_paths) |rel| {
                 const route = try routePath(alloc, rel);
                 switch (route) {
-                    .passport => |key| try keys.append(alloc, key),
+                    .signet => |key| try keys.append(alloc, key),
                     .local => {
                         const path = try std.fs.path.join(
                             alloc,
                             &.{ self.home, profile_paths.root_dir_name, rel },
                         );
                         defer alloc.free(path);
-                        localDelete(path) catch return error.PassportUnavailable;
+                        localDelete(path) catch return error.SignetUnavailable;
                     },
                 }
             }
@@ -816,7 +816,7 @@ pub const Store = struct {
         for (rel_paths) |rel| {
             const path = try std.fs.path.join(alloc, &.{ self.home, profile_paths.root_dir_name, rel });
             defer alloc.free(path);
-            localDelete(path) catch return error.PassportUnavailable;
+            localDelete(path) catch return error.SignetUnavailable;
         }
     }
 
@@ -833,7 +833,7 @@ pub const Store = struct {
         return b.scan(alloc, key, bytes);
     }
 
-    /// List entry keys (passport) or profile-relative paths (local) under
+    /// List entry keys (signet) or profile-relative paths (local) under
     /// a surface prefix such as "sessions" or "sessions/<id>".
     pub fn listSurface(self: *Store, alloc: Allocator, rel_prefix: []const u8) BackendError![][]u8 {
         if (self.activeBackend()) |b| {
@@ -850,7 +850,7 @@ pub const Store = struct {
 };
 
 /// The entry-key prefix a profile-relative directory prefix routes to, if
-/// the directory is a passport surface at all. Caller frees the result.
+/// the directory is a signet surface at all. Caller frees the result.
 fn routePrefix(alloc: Allocator, rel_prefix: []const u8) Allocator.Error!?[]u8 {
     const trimmed = std.mem.trimEnd(u8, rel_prefix, "/");
     if (trimmed.len == 0 or !client_mod.isValidPathShape(trimmed)) return null;
@@ -873,7 +873,7 @@ fn routePrefix(alloc: Allocator, rel_prefix: []const u8) Allocator.Error!?[]u8 {
 
 // ─── Store-opening seam for the store wrappers ──────────────────────────
 
-/// Open a passport-enabled Store for a home dir, heap-allocated for the
+/// Open a signet-enabled Store for a home dir, heap-allocated for the
 /// store wrappers that hold it behind an optional pointer. Returns null
 /// when the backend is disabled; a misconfigured enabled state (missing
 /// secrets, bad namespace) propagates rather than silently falling back
@@ -882,7 +882,7 @@ pub fn openEnabled(alloc: Allocator, home: []const u8) !?*Store {
     const store = try alloc.create(Store);
     errdefer alloc.destroy(store);
     store.* = try Store.open(alloc, home);
-    if (!store.passportEnabled()) {
+    if (!store.signetEnabled()) {
         store.deinit();
         alloc.destroy(store);
         return null;
@@ -897,7 +897,7 @@ pub fn destroyOwned(store: *Store) void {
     alloc.destroy(store);
 }
 
-/// The persisted anti-rollback cursor for a passport namespace (PS-041).
+/// The persisted anti-rollback cursor for a signet namespace (PS-041).
 const ManifestState = struct {
     seq: u64,
     /// sha256 hex of the last verified canonical manifest. Owned slice.
@@ -906,30 +906,30 @@ const ManifestState = struct {
 
 /// Load {seq, canonical_sha256} written by Client.persistManifestState.
 /// Null when no cursor exists yet; a malformed file is fail-closed
-/// (PassportStateCorrupt) rather than a silently reset seq floor.
+/// (SignetStateCorrupt) rather than a silently reset seq floor.
 fn loadManifestState(alloc: Allocator, path: []const u8) !?ManifestState {
     const bytes = blk: {
         var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
             error.FileNotFound => return null,
-            else => return error.PassportStateCorrupt,
+            else => return error.SignetStateCorrupt,
         };
         defer file.close(io_mod.getIo());
         break :blk io_mod.readFileToEnd(alloc, &file, 64 * 1024) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.PassportStateCorrupt,
+            else => return error.SignetStateCorrupt,
         };
     };
     defer alloc.free(bytes);
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch
-        return error.PassportStateCorrupt;
+        return error.SignetStateCorrupt;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.PassportStateCorrupt;
+    if (parsed.value != .object) return error.SignetStateCorrupt;
     const obj = parsed.value.object;
-    const seq_v = obj.get("seq") orelse return error.PassportStateCorrupt;
-    const hash_v = obj.get("canonical_sha256") orelse return error.PassportStateCorrupt;
-    if (seq_v != .integer or seq_v.integer < 0) return error.PassportStateCorrupt;
-    if (hash_v != .string or hash_v.string.len != 64) return error.PassportStateCorrupt;
+    const seq_v = obj.get("seq") orelse return error.SignetStateCorrupt;
+    const hash_v = obj.get("canonical_sha256") orelse return error.SignetStateCorrupt;
+    if (seq_v != .integer or seq_v.integer < 0) return error.SignetStateCorrupt;
+    if (hash_v != .string or hash_v.string.len != 64) return error.SignetStateCorrupt;
     return .{
         .seq = @intCast(seq_v.integer),
         .canonical_sha256 = try alloc.dupe(u8, hash_v.string),
@@ -947,7 +947,7 @@ pub fn homeFromFxPath(fx_path: []const u8) ?[]const u8 {
 
 // ─── Test seam ──────────────────────────────────────────────────────────
 
-/// In-memory backend shared by the passport unit tests. Counts each vtable
+/// In-memory backend shared by the signet unit tests. Counts each vtable
 /// call so tests can pin batching behavior.
 pub const MockBackend = struct {
     entries: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -1057,9 +1057,9 @@ test "routePath maps the enumerated surfaces and nothing else" {
     };
     for (cases) |case| {
         const route = try routePath(alloc, case.path);
-        try std.testing.expect(route == .passport);
-        try std.testing.expectEqualStrings(case.key, route.passport);
-        alloc.free(route.passport);
+        try std.testing.expect(route == .signet);
+        try std.testing.expectEqualStrings(case.key, route.signet);
+        alloc.free(route.signet);
     }
 
     const local_cases = [_][]const u8{
@@ -1090,7 +1090,7 @@ test "routePath maps the enumerated surfaces and nothing else" {
         const route = try routePath(alloc, path);
         switch (route) {
             .local => {},
-            .passport => |key| {
+            .signet => |key| {
                 std.debug.print("expected local for {s}, got {s}\n", .{ path, key });
                 alloc.free(key);
                 return error.TestUnexpectedRoute;
@@ -1112,7 +1112,7 @@ test "disabled store reads and writes the same local file" {
 
     var store = try Store.init(alloc, home, null);
     defer store.deinit();
-    try std.testing.expect(!store.passportEnabled());
+    try std.testing.expect(!store.signetEnabled());
 
     try store.writeSurface(alloc, "memories.json", "[\"a\"]\n");
     const read_back = (try store.readSurface(alloc, "memories.json")).?;
@@ -1136,7 +1136,7 @@ test "disabled store reads and writes the same local file" {
     try std.testing.expect((try store.readSurface(alloc, "memories.json")) == null);
 }
 
-test "enabled store routes passport surfaces through the backend only" {
+test "enabled store routes signet surfaces through the backend only" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1148,7 +1148,7 @@ test "enabled store routes passport surfaces through the backend only" {
 
     var store = try Store.init(alloc, home, mock.backend());
     defer store.deinit();
-    try std.testing.expect(store.passportEnabled());
+    try std.testing.expect(store.signetEnabled());
 
     // Redirect surface: goes to the backend as its entry key.
     try store.writeSurface(alloc, "memories.json", "[\"m1\"]\n");
@@ -1187,12 +1187,12 @@ test "enabled store routes passport surfaces through the backend only" {
     try std.testing.expectEqualStrings("{\"token\":\"x\"}", auth_disk);
     try std.testing.expect(mock.entries.get("auth.json") == null);
 
-    // Delete routes to the backend for passport surfaces.
+    // Delete routes to the backend for signet surfaces.
     try store.deleteSurface(alloc, "memories.json");
     try std.testing.expectEqual(@as(usize, 1), mock.deletes);
     try std.testing.expect((try store.readSurface(alloc, "memories.json")) == null);
 
-    // List on the backend sees passport keys under the prefix.
+    // List on the backend sees signet keys under the prefix.
     const session_keys = try store.listSurface(alloc, "sessions/");
     defer {
         for (session_keys) |k| alloc.free(k);
@@ -1212,14 +1212,14 @@ fn wireClient(
     id: *const identity.Identity,
 ) !client_mod.Client {
     return client_mod.Client.init(alloc, server.transport(), .{
-        .url = "http://passport.test",
+        .url = "http://signet.test",
         .key_pair = id.key_pair,
         .did = id.did,
         .passphrase = "wire-test-passphrase",
     });
 }
 
-test "passport backend retries a stale base and still commits" {
+test "signet backend retries a stale base and still commits" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1236,7 +1236,7 @@ test "passport backend retries a stale base and still commits" {
     var client = try wireClient(alloc, &server, &id);
     defer client.deinit();
 
-    var pb = PassportBackend{ .client = &client };
+    var pb = SignetBackend{ .client = &client };
     var store = try Store.init(alloc, home, pb.backend());
     defer store.deinit();
 
@@ -1249,7 +1249,7 @@ test "passport backend retries a stale base and still commits" {
     try std.testing.expect(server.entries.get(client_mod.manifest_entry_key) != null);
 }
 
-test "passport backend exhausts bounded stale-base retries" {
+test "signet backend exhausts bounded stale-base retries" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1260,19 +1260,19 @@ test "passport backend exhausts bounded stale-base retries" {
     defer server.deinit();
     server.namespace_missing = true;
     // One 409 past the retry budget.
-    server.stale_puts_left = PassportBackend.stale_base_max_attempts;
+    server.stale_puts_left = SignetBackend.stale_base_max_attempts;
 
     var id = try identity.identityFromSeed(alloc, [_]u8{9} ** 32);
     defer id.deinit(alloc);
     var client = try wireClient(alloc, &server, &id);
     defer client.deinit();
 
-    var pb = PassportBackend{ .client = &client };
+    var pb = SignetBackend{ .client = &client };
     var store = try Store.init(alloc, home, pb.backend());
     defer store.deinit();
 
     try std.testing.expectError(
-        error.PassportStaleBase,
+        error.SignetStaleBase,
         store.writeSurface(alloc, "memories.json", "[\"m1\"]\n"),
     );
     try std.testing.expect(server.entries.get("memory/memories.json") == null);

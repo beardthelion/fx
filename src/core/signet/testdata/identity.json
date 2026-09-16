@@ -1,10 +1,10 @@
 {
-  "specVersion": "passport-spec/0.1",
+  "specVersion": "signet-spec/0.1",
   "genesisSeedHex": "6903fb30ef078b4eb05eae11d9ee19786de1b9142af662fdf72540aea06ff1a0",
   "genesisDid": "did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
   "successorSeedHex": "198c2f21d2aabbd7e56d4918f6dea3809422632756d8284da0449765b5999a9e",
   "successorDid": "did:key:z6MkjsHJ27VECNVM394DimiaZpUzitPHA63iRWLVhj4yxdnN",
-  "namespace": "passport:did_key_z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
+  "namespace": "signet:did_key_z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
   "signMessage": "{\"proof\":\"did:key signs\"}",
   "signature": "793VdfftO8SY72VpY69qtjZ8IcYroKnIDKaSasE71JBDvHTEfXMBRptfUnnA5FIa3gxtQ5qEeITr1oWEmdw5CQ==",
   "publicKeyHex": "1d662034bac14e51f660cd712c74b9fe893942c21e5d75062545128386f4485e"

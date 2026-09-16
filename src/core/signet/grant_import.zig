@@ -1,7 +1,7 @@
-//! Pending-grant listing and the passport grant record path.
+//! Pending-grant listing and the signet grant record path.
 //!
 //! Read path (PS-061): `listPending` lists `grants/` entries that map onto
-//! fx's tool model and are still holder-decidable; `/permissions passport`
+//! fx's tool model and are still holder-decidable; `/permissions signet`
 //! resolves one with `findPending`, applies it to the permission engine,
 //! and journals the explicit decision with `recordDecision` so a grant is
 //! never re-presented. Expired and unmapped grants never reach the holder
@@ -24,7 +24,7 @@ const store_redirect = @import("store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
 
-const journal_dir_name = "passport";
+const journal_dir_name = "signet";
 const journal_file_name = "grant-decisions.jsonl";
 const max_journal_bytes: usize = 256 * 1024;
 
@@ -42,7 +42,7 @@ pub const Decision = enum {
 
 // ─── Decision journal ───────────────────────────────────────────────────
 //
-// ~/.fx/passport/grant-decisions.jsonl holds one
+// ~/.fx/signet/grant-decisions.jsonl holds one
 // {"id":"<grant-id>","decision":"confirmed|denied"} line per explicit
 // holder decision. It is local on purpose: it records what this harness
 // decided, which is not portable state.
@@ -222,7 +222,7 @@ pub fn findPending(pending: []grants.GrantDoc, id: []const u8) ?*grants.GrantDoc
 // ─── Record path (PS-062) ───────────────────────────────────────────────
 
 /// The action class an fx tool name reverse-maps to, if any. Tools with
-/// no passport class produce no grant record. Iterating the enum fields
+/// no signet class produce no grant record. Iterating the enum fields
 /// keeps this aligned with ActionClass automatically — a new class needs
 /// no second table here.
 pub fn actionClassForTool(tool_name: []const u8) ?grants.ActionClass {
@@ -241,8 +241,8 @@ pub fn formatIso8601Z(alloc: Allocator, ms: i64) ![]u8 {
     return shared_types.formatGatewayTimestampZ(alloc, ms);
 }
 
-/// Record a holder-confirmed fx session grant into the passport. Tools
-/// outside the passport action vocabulary produce no record. Returns the
+/// Record a holder-confirmed fx session grant into the signet. Tools
+/// outside the signet action vocabulary produce no record. Returns the
 /// grant id, or null when the tool has no action class.
 pub fn recordToolGrant(
     alloc: Allocator,
@@ -286,25 +286,25 @@ pub fn recordToolGrant(
 /// grant-recording callers. Returns the owned store when the backend is
 /// live, null when HOME is unset or the backend is disabled; open
 /// failures propagate (a misconfigured enabled state fails closed).
-pub fn openPassportStoreFromEnv(alloc: Allocator) !?store_redirect.Store {
+pub fn openSignetStoreFromEnv(alloc: Allocator) !?store_redirect.Store {
     const home = io_mod.getenv("HOME") orelse return null;
     var store = try store_redirect.Store.open(alloc, home);
-    if (!store.passportEnabled()) {
+    if (!store.signetEnabled()) {
         store.deinit();
         return null;
     }
     return store;
 }
 
-/// Record a holder-confirmed session grant into the passport (PS-062).
+/// Record a holder-confirmed session grant into the signet (PS-062).
 /// Best-effort outside the authority lock: a record failure must not
 /// stall or fail the local grant, so it logs and returns instead.
 pub fn recordSessionGrantBestEffort(alloc: Allocator, tool_name: []const u8, scope: []const u8) void {
-    var store = (openPassportStoreFromEnv(alloc) catch null) orelse return;
+    var store = (openSignetStoreFromEnv(alloc) catch null) orelse return;
     defer store.deinit();
     const id = recordToolGrant(alloc, &store, tool_name, scope, io_mod.milliTimestamp()) catch |err| {
         debug_trace.logf(
-            "passport",
+            "signet",
             "event=grant_record_failed tool={s} err={s}",
             .{ tool_name, @errorName(err) },
         );

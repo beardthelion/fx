@@ -8,7 +8,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
-const passport_config = @import("core/passport/config.zig");
+const signet_config = @import("core/signet/config.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
@@ -544,12 +544,12 @@ fn ensureThreadedIo() void {
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
         // Same custody rule as the CLI entry, minus the in-place rewrite:
         // the host process owns its libc environ, so fx captures
-        // FX_PASSPORT_* for config and relies on the clone-time scrub hook
+        // FX_SIGNET_* for config and relies on the clone-time scrub hook
         // to keep spawned children from inheriting them. A capture failure
         // is not fatal here: the scrub hook is installed before the
         // fallible walk, and config resolution falls back to live getenv
         // because the host environ retains the entries.
-        passport_config.captureRawEnv(std.heap.c_allocator, raw_environ) catch {};
+        signet_config.captureRawEnv(std.heap.c_allocator, raw_environ) catch {};
         io_mod.setRawEnviron(raw_environ);
         const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
         defer if (workspace_root) |path| std.heap.c_allocator.free(path);

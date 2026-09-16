@@ -1,7 +1,7 @@
-//! Session-end learning capture for the passport backend (spec PS-120;
+//! Session-end learning capture for the signet backend (spec PS-120;
 //! suite plan KTD8 / unit U7).
 //!
-//! The authoritative distillation lives in the passport-suite TypeScript
+//! The authoritative distillation lives in the signet-suite TypeScript
 //! layer (src/learn/). This file is the fx trigger: when a writable
 //! session ends, the learning candidates recorded in the session's
 //! `learnings.jsonl` sidecar are rendered as `memory/<type>/<slug>.md`
@@ -169,7 +169,7 @@ fn readLearningsFile(
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.size > max_learnings_bytes) {
-        return error.PassportLearnCorrupt;
+        return error.SignetLearnCorrupt;
     }
     return try io_mod.readFileToEnd(alloc, &file, max_learnings_bytes);
 }
@@ -203,14 +203,14 @@ fn parseLine(alloc: Allocator, line: []const u8) Allocator.Error!?Rendered {
 }
 
 /// Write one learning immediately — the explicit-save trigger. Returns
-/// false when the passport backend is disabled or the candidate is
+/// false when the signet backend is disabled or the candidate is
 /// malformed; both are clean no-ops, never partial writes.
 pub fn saveLearning(
     alloc: Allocator,
     store: *store_redirect.Store,
     learning: Learning,
 ) !bool {
-    if (!store.passportEnabled()) return false;
+    if (!store.signetEnabled()) return false;
     var rendered = (try render(alloc, learning)) orelse return false;
     defer rendered.deinit(alloc);
     try store.writeSurface(alloc, rendered.key, rendered.content);
@@ -226,7 +226,7 @@ pub fn captureSessionEnd(
     store: *store_redirect.Store,
     session_dir: *const io_mod.VerifiedDir,
 ) !void {
-    if (!store.passportEnabled()) return;
+    if (!store.signetEnabled()) return;
     const bytes = (try readLearningsFile(alloc, session_dir)) orelse return;
     defer alloc.free(bytes);
 
@@ -353,7 +353,7 @@ test "session-end capture writes typed memory entries through the store seam" {
     defer session_vd.close();
     try io_mod.durableReplaceVerified(alloc, &session_vd, learnings_file,
         \\{"type":"user","slug":"prefers-pnpm","title":"I prefer pnpm over npm.","body":"I prefer pnpm over npm for all package management."}
-        \\{"type":"project","title":"We decided to store agent state in the passport.","body":"We decided to store agent state in the passport, not in vendor clouds."}
+        \\{"type":"project","title":"We decided to store agent state in the signet.","body":"We decided to store agent state in the signet, not in vendor clouds."}
         \\{"type":"bogus","title":"not a type","body":"rejected"}
         \\not json at all
         \\
@@ -379,7 +379,7 @@ test "session-end capture writes typed memory entries through the store seam" {
     try testing.expectEqual(@as(usize, 2), count);
 }
 
-test "capture is a no-op when the passport backend is disabled" {
+test "capture is a no-op when the signet backend is disabled" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -388,7 +388,7 @@ test "capture is a no-op when the passport backend is disabled" {
 
     var store = try store_redirect.Store.init(alloc, home, null);
     defer store.deinit();
-    try testing.expect(!store.passportEnabled());
+    try testing.expect(!store.signetEnabled());
 
     var session_vd = try sessionDir(alloc, &tmp);
     defer session_vd.close();
@@ -465,7 +465,7 @@ test "collides propagates a read failure instead of overwriting the entry" {
     );
 
     try testing.expectError(
-        error.PassportUnavailable,
+        error.SignetUnavailable,
         captureSessionEnd(alloc, &store, &session_vd),
     );
     // The prior entry is untouched.

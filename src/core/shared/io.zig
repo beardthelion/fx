@@ -16,8 +16,8 @@ var global_environ_block: ?std.process.Environ.Block = null;
 var global_raw_environ: ?RawEnviron = null;
 
 /// When set, cloneEnvironMap drops every key for which the hook returns
-/// true. Installed once at startup by the passport config layer so
-/// FX_PASSPORT_* secrets never reach spawned children regardless of which
+/// true. Installed once at startup by the signet config layer so
+/// FX_SIGNET_* secrets never reach spawned children regardless of which
 /// environ representation (raw envp, block, or host-provided map) is live.
 var environ_scrub_hook: ?*const fn (key: []const u8) bool = null;
 

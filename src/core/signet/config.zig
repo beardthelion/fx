@@ -1,14 +1,14 @@
-//! Passport backend configuration: opt-in detection and FX_PASSPORT_* env
+//! Signet backend configuration: opt-in detection and FX_SIGNET_* env
 //! custody.
 //!
 //! The backend is opt-in ONLY, resolved from exactly two sources:
-//!   1. `~/.fx/settings.json` -> `"passport": {"enabled": true, "url": ...}`
-//!   2. `FX_PASSPORT_*` environment variables
+//!   1. `~/.fx/settings.json` -> `"signet": {"enabled": true, "url": ...}`
+//!   2. `FX_SIGNET_*` environment variables
 //!
 //! Committed project config (.fx.json) is never consulted: a checked-in
 //! file must not be able to point a checkout at a shared state backend.
 //!
-//! FX_PASSPORT_* variables can carry secrets (passphrase, seed). They are
+//! FX_SIGNET_* variables can carry secrets (passphrase, seed). They are
 //! captured at process start and then scrubbed from every environment
 //! representation fx can pass to a spawned process, so tool and shell
 //! children never inherit them.
@@ -24,15 +24,15 @@ const Allocator = std.mem.Allocator;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-pub const env_prefix = "FX_PASSPORT_";
-pub const env_enabled = "FX_PASSPORT_ENABLED";
-pub const env_url = "FX_PASSPORT_URL";
-pub const env_namespace = "FX_PASSPORT_NAMESPACE";
-pub const env_passphrase = "FX_PASSPORT_PASSPHRASE";
-pub const env_seed = "FX_PASSPORT_SEED";
-pub const env_scan = "FX_PASSPORT_SCAN";
+pub const env_prefix = "FX_SIGNET_";
+pub const env_enabled = "FX_SIGNET_ENABLED";
+pub const env_url = "FX_SIGNET_URL";
+pub const env_namespace = "FX_SIGNET_NAMESPACE";
+pub const env_passphrase = "FX_SIGNET_PASSPHRASE";
+pub const env_seed = "FX_SIGNET_SEED";
+pub const env_scan = "FX_SIGNET_SCAN";
 
-const custody_dir_name = "passport";
+const custody_dir_name = "signet";
 const passphrase_file_name = "passphrase";
 const seed_file_name = "seed";
 
@@ -40,7 +40,7 @@ const max_settings_bytes: usize = 64 * 1024;
 const max_secret_file_bytes: usize = 4 * 1024;
 
 pub const Config = struct {
-    /// Passport store base URL, e.g. http://localhost:8080.
+    /// Signet store base URL, e.g. http://localhost:8080.
     url: []u8,
     /// Explicit namespace override (normally derived from the genesis DID).
     namespace: ?[]u8 = null,
@@ -67,12 +67,12 @@ fn secureFree(alloc: Allocator, bytes: []u8) void {
     alloc.free(bytes);
 }
 
-// ─── Captured FX_PASSPORT_* environment ─────────────────────────────────
+// ─── Captured FX_SIGNET_* environment ─────────────────────────────────
 
 var captured_mutex: std.Io.Mutex = .init;
 var captured: ?std.StringHashMapUnmanaged([]const u8) = null;
 
-/// The captured value of an FX_PASSPORT_* variable. These are read before
+/// The captured value of an FX_SIGNET_* variable. These are read before
 /// scrubbing; after captureAndScrub runs they are unavailable from the
 /// process environment by design.
 pub fn capturedGet(key: []const u8) ?[]const u8 {
@@ -82,25 +82,25 @@ pub fn capturedGet(key: []const u8) ?[]const u8 {
     return map.get(key);
 }
 
-fn isPassportEnvKey(key: []const u8) bool {
+fn isSignetEnvKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, env_prefix);
 }
 
-/// Install the clone-time scrub hook so FX_PASSPORT_* keys are dropped
+/// Install the clone-time scrub hook so FX_SIGNET_* keys are dropped
 /// from every child environment map, regardless of which environ
 /// representation (raw envp, block, or host-installed map) a host set.
 /// Idempotent.
 pub fn installEnvScrub() void {
-    io_mod.setEnvironScrubHook(isPassportEnvKey);
+    io_mod.setEnvironScrubHook(isSignetEnvKey);
 }
 
-/// A passport env value, whether it was captured pre-scrub (raw envp
+/// A signet env value, whether it was captured pre-scrub (raw envp
 /// startup path) or is still readable from a host-installed environ map.
 fn envValueFor(key: []const u8) ?[]const u8 {
     return capturedGet(key) orelse io_mod.getenv(key);
 }
 
-fn isPassportEnvEntry(entry: []const u8) bool {
+fn isSignetEnvEntry(entry: []const u8) bool {
     const eq = std.mem.findScalar(u8, entry, '=') orelse return false;
     return std.mem.startsWith(u8, entry[0..eq], env_prefix);
 }
@@ -124,7 +124,7 @@ fn unsetEnvPosix(key: []const u8) void {
     _ = unsetenv(buf[0..key.len :0]);
 }
 
-/// Capture every FX_PASSPORT_* entry from `raw_env` without mutating it,
+/// Capture every FX_SIGNET_* entry from `raw_env` without mutating it,
 /// and install the clone-time scrub hook so child environments still drop
 /// the secrets. Hosts embedding fx (napi) call this: the host's libc
 /// environ is not ours to rewrite. Capture failure is fatal to the
@@ -142,7 +142,7 @@ pub fn captureRawEnv(alloc: Allocator, raw_env: io_mod.RawEnviron) error{OutOfMe
     var i: usize = 0;
     while (raw_env[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
-        if (!isPassportEnvEntry(entry)) continue;
+        if (!isSignetEnvEntry(entry)) continue;
         const key = try alloc.dupe(u8, envKey(entry));
         errdefer alloc.free(key);
         const value = try alloc.dupe(u8, envValue(entry));
@@ -159,7 +159,7 @@ pub fn captureRawEnv(alloc: Allocator, raw_env: io_mod.RawEnviron) error{OutOfMe
     captured = map;
 }
 
-/// Capture every FX_PASSPORT_* entry from `raw_env`, then remove them in
+/// Capture every FX_SIGNET_* entry from `raw_env`, then remove them in
 /// place so downstream environ blocks (and therefore spawned children)
 /// never see them. Call once, before io_mod.setRawEnviron, in the process
 /// entry path. Only the owning process entry point may call this — it
@@ -186,7 +186,7 @@ pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) error{Ou
     var src: usize = 0;
     while (raw_env[src]) |entry_z| : (src += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
-        if (isPassportEnvEntry(entry)) continue;
+        if (isSignetEnvEntry(entry)) continue;
         mut_env[dst] = entry_z;
         dst += 1;
     }
@@ -218,20 +218,20 @@ fn readBoundedFile(alloc: Allocator, path: []const u8, max_bytes: usize) !?[]u8 
     return try io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
-const SettingsPassport = struct {
+const SettingsSignet = struct {
     enabled: bool = false,
     url: ?[]u8 = null,
     namespace: ?[]u8 = null,
 };
 
-/// Read only the "passport" block out of ~/.fx/settings.json. This is a
+/// Read only the "signet" block out of ~/.fx/settings.json. This is a
 /// minimal, read-only parse: the settings store itself is untouched, and a
 /// missing, unreadable, or malformed file simply means "not configured".
 /// Read errors must not surface here: the owning stores classify unsafe or
 /// absent paths themselves, at their own stage, so a probe that reports
 /// e.g. DurablePathUnsafe would reorder failure modes when the backend is
 /// disabled.
-fn readSettingsBlock(alloc: Allocator, home: []const u8) !?SettingsPassport {
+fn readSettingsBlock(alloc: Allocator, home: []const u8) !?SettingsSignet {
     const path = try profile_paths.settingsPath(alloc, home);
     defer alloc.free(path);
     const bytes = readBoundedFile(alloc, path, max_settings_bytes) catch |err| switch (err) {
@@ -243,10 +243,10 @@ fn readSettingsBlock(alloc: Allocator, home: []const u8) !?SettingsPassport {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const block = parsed.value.object.get("passport") orelse return null;
+    const block = parsed.value.object.get("signet") orelse return null;
     if (block != .object) return null;
 
-    var out: SettingsPassport = .{};
+    var out: SettingsSignet = .{};
     if (block.object.get("enabled")) |v| {
         if (v == .bool) out.enabled = v.bool;
     }
@@ -259,7 +259,7 @@ fn readSettingsBlock(alloc: Allocator, home: []const u8) !?SettingsPassport {
     return out;
 }
 
-/// Read a 0600 custody file under ~/.fx/passport/. Refuses group/other
+/// Read a 0600 custody file under ~/.fx/signet/. Refuses group/other
 /// access bits, per PS-101.
 fn readCustodyFile(alloc: Allocator, home: []const u8, name: []const u8) !?[]u8 {
     const dir_path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, custody_dir_name });
@@ -287,7 +287,7 @@ fn parseSeedHex(text: []const u8) ?[32]u8 {
     return seed;
 }
 
-/// Resolve the effective passport config for a home dir. Returns null when
+/// Resolve the effective signet config for a home dir. Returns null when
 /// the backend is disabled. The caller owns the Config's slices; free with
 /// Config.deinit.
 pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
@@ -306,7 +306,7 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
     }
 
     // Environment wins over settings.json (fx's standard precedence), and
-    // can also explicitly disable. An explicit FX_PASSPORT_ENABLED=0 takes
+    // can also explicitly disable. An explicit FX_SIGNET_ENABLED=0 takes
     // precedence over everything else, including a URL that would
     // otherwise imply enablement.
     var explicit_disable = false;
@@ -338,7 +338,7 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
         return null;
     }
 
-    const final_url = url orelse return error.PassportUrlMissing;
+    const final_url = url orelse return error.SignetUrlMissing;
 
     var config: Config = .{ .url = final_url, .namespace = namespace };
 
@@ -368,13 +368,13 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
-test "captureAndScrubRaw captures then strips FX_PASSPORT_* entries" {
+test "captureAndScrubRaw captures then strips FX_SIGNET_* entries" {
     const alloc = std.testing.allocator;
 
     const entries = [_][:0]u8{
         try alloc.dupeZ(u8, "HOME=/home/test"),
-        try alloc.dupeZ(u8, "FX_PASSPORT_URL=http://localhost:9"),
-        try alloc.dupeZ(u8, "FX_PASSPORT_ENABLED=1"),
+        try alloc.dupeZ(u8, "FX_SIGNET_URL=http://localhost:9"),
+        try alloc.dupeZ(u8, "FX_SIGNET_ENABLED=1"),
         try alloc.dupeZ(u8, "PATH=/bin"),
     };
     defer for (entries) |e| alloc.free(e);
@@ -410,7 +410,7 @@ test "captureAndScrubRaw captures then strips FX_PASSPORT_* entries" {
     try std.testing.expectEqual(@as(usize, 2), remaining);
 }
 
-test "captureAndScrubRaw captures every adjacent FX_PASSPORT_* var from the real environ" {
+test "captureAndScrubRaw captures every adjacent FX_SIGNET_* var from the real environ" {
     if (comptime !builtin.link_libc) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
@@ -418,13 +418,13 @@ test "captureAndScrubRaw captures every adjacent FX_PASSPORT_* var from the real
     // aliases libc environ — the array unsetenv mutates. A synthetic buffer
     // cannot see that, so this test installs real environ entries.
     const names = [_][:0]const u8{
-        "FX_PASSPORT_U7_ALPHA",
-        "FX_PASSPORT_U7_BETA",
-        "FX_PASSPORT_U7_GAMMA",
+        "FX_SIGNET_U7_ALPHA",
+        "FX_SIGNET_U7_BETA",
+        "FX_SIGNET_U7_GAMMA",
     };
     const values = [_][:0]const u8{ "u7-alpha", "u7-beta", "u7-gamma" };
 
-    // Isolate the assertion set: drop any ambient FX_PASSPORT_* vars.
+    // Isolate the assertion set: drop any ambient FX_SIGNET_* vars.
     // Collect-then-remove — the same rule the fix follows, because environ
     // shifts under unsetenv while it is being walked.
     while (true) {
@@ -432,7 +432,7 @@ test "captureAndScrubRaw captures every adjacent FX_PASSPORT_* var from the real
         var scan: usize = 0;
         while (std.c.environ[scan]) |entry_z| : (scan += 1) {
             const entry = std.mem.sliceTo(entry_z, 0);
-            if (isPassportEnvEntry(entry)) {
+            if (isSignetEnvEntry(entry)) {
                 hit = envKey(entry);
                 break;
             }
@@ -475,7 +475,7 @@ test "captureAndScrubRaw captures every adjacent FX_PASSPORT_* var from the real
     // And none may survive in environ.
     var scan: usize = 0;
     while (std.c.environ[scan]) |entry_z| : (scan += 1) {
-        try std.testing.expect(!isPassportEnvEntry(std.mem.sliceTo(entry_z, 0)));
+        try std.testing.expect(!isSignetEnvEntry(std.mem.sliceTo(entry_z, 0)));
     }
 }
 
@@ -489,7 +489,7 @@ test "resolve is disabled without settings or env" {
     try std.testing.expect((try resolve(alloc, home)) == null);
 }
 
-test "resolve reads the settings.json passport block only" {
+test "resolve reads the settings.json signet block only" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -499,7 +499,7 @@ test "resolve reads the settings.json passport block only" {
     try tmp.dir.createDir(std.testing.io, ".fx", .default_dir);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = ".fx/settings.json",
-        .data = "{\"model\":\"x\",\"passport\":{\"enabled\":true,\"url\":\"http://localhost:8080\"}}",
+        .data = "{\"model\":\"x\",\"signet\":{\"enabled\":true,\"url\":\"http://localhost:8080\"}}",
     });
 
     var config = (try resolve(alloc, home)).?;
@@ -508,7 +508,7 @@ test "resolve reads the settings.json passport block only" {
     try std.testing.expect(config.scan_mode == .block);
 }
 
-test "explicit FX_PASSPORT_ENABLED=0 beats settings and URL enablement" {
+test "explicit FX_SIGNET_ENABLED=0 beats settings and URL enablement" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -518,14 +518,14 @@ test "explicit FX_PASSPORT_ENABLED=0 beats settings and URL enablement" {
     try tmp.dir.createDir(std.testing.io, ".fx", .default_dir);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = ".fx/settings.json",
-        .data = "{\"passport\":{\"enabled\":true,\"url\":\"http://localhost:8080\"}}",
+        .data = "{\"signet\":{\"enabled\":true,\"url\":\"http://localhost:8080\"}}",
     });
 
     // The captured env carries both the explicit disable and a URL that
     // would otherwise imply enablement.
     const entries = [_][:0]u8{
-        try alloc.dupeZ(u8, "FX_PASSPORT_ENABLED=0"),
-        try alloc.dupeZ(u8, "FX_PASSPORT_URL=http://localhost:9"),
+        try alloc.dupeZ(u8, "FX_SIGNET_ENABLED=0"),
+        try alloc.dupeZ(u8, "FX_SIGNET_URL=http://localhost:9"),
     };
     defer for (entries) |e| alloc.free(e);
     var env_buf: [3]?[*:0]const u8 = undefined;

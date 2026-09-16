@@ -15,9 +15,9 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_resume_view = @import("session_resume_view.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
-const session_sync = @import("../passport/session_sync.zig");
-const passport_learn = @import("../passport/learn.zig");
-const store_redirect = @import("../passport/store_redirect.zig");
+const session_sync = @import("../signet/session_sync.zig");
+const signet_learn = @import("../signet/learn.zig");
+const store_redirect = @import("../signet/store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
@@ -309,7 +309,7 @@ pub const ResumeViewAdmission = struct {
     writable: ?WritableSessionDir,
     /// Borrowed from the admitting Root; transferred onto the loaded
     /// session so commit mirroring keeps working after resume.
-    passport: ?*store_redirect.Store = null,
+    signet: ?*store_redirect.Store = null,
     view: session_resume_view.LoadOutcome,
 
     pub fn deinit(self: *ResumeViewAdmission, alloc: Allocator) void {
@@ -333,7 +333,7 @@ pub const ResumeViewAdmission = struct {
             writable.deinit(alloc);
             return err;
         };
-        loaded.passport = self.passport;
+        loaded.signet = self.signet;
         return loaded;
     }
 };
@@ -557,8 +557,8 @@ pub const LoadedWritableSession = struct {
     usage_sidecar_reseal_pending: bool = false,
     resume_view_stale: bool = false,
     /// Borrowed from the Root that opened this session; when live, commits
-    /// mirror the session directory into the passport store.
-    passport: ?*store_redirect.Store = null,
+    /// mirror the session directory into the signet store.
+    signet: ?*store_redirect.Store = null,
     /// Runtime-only provenance installed by subagent resume admission. These
     /// fields are never written into the session event log.
     external_prompt_origin: ExternalPromptOrigin = .root,
@@ -571,11 +571,11 @@ pub const LoadedWritableSession = struct {
         // commit mirror writes through. Best-effort like the mirror — a
         // capture failure is traced, never propagated, and the local
         // session teardown proceeds regardless.
-        if (self.passport) |store| {
-            passport_learn.captureSessionEnd(alloc, store, &self.log.dir) catch |err| {
+        if (self.signet) |store| {
+            signet_learn.captureSessionEnd(alloc, store, &self.log.dir) catch |err| {
                 debug_trace.logf(
                     "session",
-                    "event=passport_learn_failed session={s} err={s}",
+                    "event=signet_learn_failed session={s} err={s}",
                     .{ self.active_id, @errorName(err) },
                 );
             };
@@ -631,14 +631,14 @@ pub const LoadedWritableSession = struct {
     }
 
     /// Best-effort mirror of the just-committed session directory into
-    /// the passport store. The local commit is authoritative; a mirror
+    /// the signet store. The local commit is authoritative; a mirror
     /// failure is traced, never propagated.
-    fn mirrorToPassport(self: *LoadedWritableSession, alloc: Allocator) void {
-        const store = self.passport orelse return;
+    fn mirrorToSignet(self: *LoadedWritableSession, alloc: Allocator) void {
+        const store = self.signet orelse return;
         session_sync.mirrorSession(alloc, store, &self.log.dir, self.active_id) catch |err| {
             debug_trace.logf(
                 "session",
-                "event=passport_mirror_failed session={s} err={s}",
+                "event=signet_mirror_failed session={s} err={s}",
                 .{ self.active_id, @errorName(err) },
             );
         };
@@ -712,7 +712,7 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
-        self.mirrorToPassport(alloc);
+        self.mirrorToSignet(alloc);
         if (!lifecycle_published) {
             self.state_replacement_pending = true;
         } else {
@@ -775,7 +775,7 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
-        self.mirrorToPassport(alloc);
+        self.mirrorToSignet(alloc);
         if (!lifecycle_published) self.state_replacement_pending = true;
         return self.position;
     }
@@ -1045,13 +1045,13 @@ test "large session errors preserve their exact error type and identity" {
 pub const Root = struct {
     sessions: ?io_mod.VerifiedDir,
     display_root: []u8,
-    /// Retained so a passport-enabled root can materialize the local
+    /// Retained so a signet-enabled root can materialize the local
     /// sessions directory on first hydration.
     home_path: []u8,
     mode: OpenMode,
-    /// Live when the passport backend is enabled; owned. Session commits
+    /// Live when the signet backend is enabled; owned. Session commits
     /// mirror into it and open-by-id misses hydrate from it.
-    passport: ?*store_redirect.Store = null,
+    signet: ?*store_redirect.Store = null,
 
     pub fn initFromHome(
         alloc: Allocator,
@@ -1060,8 +1060,8 @@ pub const Root = struct {
     ) !Root {
         // Misconfigured enabled state propagates: silently falling back to
         // local-only storage would hide writes the holder expects encrypted.
-        const passport = try store_redirect.openEnabled(alloc, home_path);
-        errdefer if (passport) |p| store_redirect.destroyOwned(p);
+        const signet = try store_redirect.openEnabled(alloc, home_path);
+        errdefer if (signet) |p| store_redirect.destroyOwned(p);
         const owned_home = try alloc.dupe(u8, home_path);
         errdefer alloc.free(owned_home);
         const zio = io_mod.getIo();
@@ -1076,7 +1076,7 @@ pub const Root = struct {
                         ),
                         .mode = mode,
                         .home_path = owned_home,
-                        .passport = passport,
+                        .signet = signet,
                     };
                 }
                 std.Io.Dir.createDirAbsolute(zio, home_path, private_dir_permissions) catch |create_err| switch (create_err) {
@@ -1103,7 +1103,7 @@ pub const Root = struct {
                         ),
                         .mode = mode,
                         .home_path = owned_home,
-                        .passport = passport,
+                        .signet = signet,
                     };
                 }
                 var verified_home = io_mod.VerifiedDir{
@@ -1142,7 +1142,7 @@ pub const Root = struct {
                         ),
                         .mode = mode,
                         .home_path = owned_home,
-                        .passport = passport,
+                        .signet = signet,
                     };
                 }
                 var parent = io_mod.VerifiedDir{ .dir = durable_home };
@@ -1167,12 +1167,12 @@ pub const Root = struct {
             .display_root = display_root,
             .home_path = owned_home,
             .mode = mode,
-            .passport = passport,
+            .signet = signet,
         };
     }
 
     pub fn deinit(self: *Root, alloc: Allocator) void {
-        if (self.passport) |p| store_redirect.destroyOwned(p);
+        if (self.signet) |p| store_redirect.destroyOwned(p);
         if (self.sessions) |*dir| dir.close();
         alloc.free(self.display_root);
         alloc.free(self.home_path);
@@ -1282,7 +1282,7 @@ pub const Root = struct {
         );
         writable_owned = false;
         errdefer created.deinit(alloc);
-        created.passport = self.passport;
+        created.signet = self.signet;
         if (lifecycle_value) |value| {
             try created.installCommitLifecycle(value);
             lifecycle_value = null;
@@ -1295,7 +1295,7 @@ pub const Root = struct {
 
     /// Materialize `~/.fx/sessions` so hydration has somewhere to write.
     /// Only reached when a session is missing locally but may exist in
-    /// the passport mirror.
+    /// the signet mirror.
     fn ensureSessionsDir(self: *Root) !*io_mod.VerifiedDir {
         if (self.sessions) |*s| return s;
         const zio = io_mod.getIo();
@@ -1311,12 +1311,12 @@ pub const Root = struct {
         return &self.sessions.?;
     }
 
-    /// Pulls a passport-mirrored session down when the local directory is
+    /// Pulls a signet-mirrored session down when the local directory is
     /// absent. Returns true when a local directory now exists. Mirror
     /// failures propagate: reporting SessionNotFound for a session that
     /// exists remotely would silently strand state.
-    pub fn hydrateFromPassport(self: *Root, alloc: Allocator, session_id: []const u8) !bool {
-        const store = self.passport orelse return false;
+    pub fn hydrateFromSignet(self: *Root, alloc: Allocator, session_id: []const u8) !bool {
+        const store = self.signet orelse return false;
         const sessions = try self.ensureSessionsDir();
         if (!try session_sync.hydrateSession(alloc, store, sessions, session_id))
             return false;
@@ -1349,7 +1349,7 @@ pub const Root = struct {
             options.session_lock_deadline_ms,
         ) catch |err| switch (err) {
             error.SessionNotFound => blk: {
-                if (try self.hydrateFromPassport(alloc, session_id)) {
+                if (try self.hydrateFromSignet(alloc, session_id)) {
                     break :blk try self.openWritableSessionDir(
                         alloc,
                         session_id,
@@ -1364,7 +1364,7 @@ pub const Root = struct {
             writable.deinit(alloc);
             return err;
         };
-        loaded.passport = self.passport;
+        loaded.signet = self.signet;
         return loaded;
     }
 
@@ -1378,7 +1378,7 @@ pub const Root = struct {
         if (self.sessions == null) {
             // The sessions dir may not exist locally at all yet (fresh
             // machine): hydrate from the mirror before declaring absence.
-            if (!try self.hydrateFromPassport(alloc, session_id)) {
+            if (!try self.hydrateFromSignet(alloc, session_id)) {
                 return error.SessionNotFound;
             }
         }
@@ -1388,7 +1388,7 @@ pub const Root = struct {
             .read_only,
         ) catch |err| switch (err) {
             error.FileNotFound => blk: {
-                if (try self.hydrateFromPassport(alloc, session_id)) {
+                if (try self.hydrateFromSignet(alloc, session_id)) {
                     break :blk openSessionDir(
                         &self.sessions.?,
                         session_id,
@@ -1477,7 +1477,7 @@ pub const Root = struct {
     ) !ResumeViewAdmission {
         var writable = self.openWritableSessionDir(alloc, session_id, 0) catch |err| switch (err) {
             error.SessionNotFound => blk: {
-                if (try self.hydrateFromPassport(alloc, session_id)) {
+                if (try self.hydrateFromSignet(alloc, session_id)) {
                     break :blk try self.openWritableSessionDir(alloc, session_id, 0);
                 }
                 return err;
@@ -1488,7 +1488,7 @@ pub const Root = struct {
         const position = try loadCurrentPositionReference(alloc, &writable.dir, session_id);
         return .{
             .writable = writable,
-            .passport = self.passport,
+            .signet = self.signet,
             .view = try session_resume_view.loadMatching(
                 alloc,
                 &writable.dir,
@@ -7666,16 +7666,16 @@ test "watermark decoder rejects malformed object keys and required strings" {
     );
 }
 
-const PassportTestBackend = store_redirect.MockBackend;
+const SignetTestBackend = store_redirect.MockBackend;
 
-test "passport hydration materializes a missing local sessions directory" {
+test "signet hydration materializes a missing local sessions directory" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
-    var mock = PassportTestBackend{};
+    var mock = SignetTestBackend{};
     defer mock.deinit(alloc);
 
     // Stage the mirror the way a commit would: a session directory under
@@ -7705,14 +7705,14 @@ test "passport hydration materializes a missing local sessions directory" {
     try std.testing.expect(root.sessions == null);
     const store = try alloc.create(store_redirect.Store);
     store.* = try store_redirect.Store.init(alloc, home, mock.backend());
-    root.passport = store; // owned by root.deinit
+    root.signet = store; // owned by root.deinit
 
     // An unmirrored id stays absent; the dir is still materialized so a
     // later hit lands somewhere writable.
-    try std.testing.expect(!try root.hydrateFromPassport(alloc, "sess999"));
+    try std.testing.expect(!try root.hydrateFromSignet(alloc, "sess999"));
     try std.testing.expect(root.sessions != null);
 
-    try std.testing.expect(try root.hydrateFromPassport(alloc, "sess001"));
+    try std.testing.expect(try root.hydrateFromSignet(alloc, "sess001"));
     var session_dir = try root.sessions.?.dir.openDir(
         io_mod.getIo(),
         "sess001",

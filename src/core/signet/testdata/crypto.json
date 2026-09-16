@@ -1,0 +1,32 @@
+{
+  "specVersion": "signet-spec/0.1",
+  "passphrase": "correct horse battery staple",
+  "namespace": "signet:did_key_z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
+  "keyHex": "b3783ee40119878e22a430b937acb6420a5decb951bf6d33c52618b40bcaaa2a",
+  "entries": {
+    "memory/MEMORY.md": {
+      "plaintext": "---\ntype: note\nprovenance: spec/vector\n---\nRemember the spec.\n",
+      "blob": "Aaqt6nL2oUCbk77qHFzwRtux/zuzUr3B9gBC8x3p29azdOsVHl/frswT4U34a4CTRtxnChNSVF2CdW/fp8GaPA/pxb+WNjmiILMUlLvsvSYBfPJjJ3TKoBoAsQ=="
+    },
+    "config/settings.json": {
+      "plaintext": "{\"model\":\"test-model\",\"theme\":\"dark\"}\n",
+      "blob": "AZLwEwuwGZATv3ddEVyIoq84V8jhcRJ65PgmxYlg9PgxpguK4IDg6g5mgbhfrortuDBZnpr+ZXgB8X6FY6nUOZsqwg=="
+    },
+    "grants/grant-001.json": {
+      "plaintext": "{\"id\":\"g1\",\"action\":\"fs.read\",\"scope\":\"src/**\",\"granted_by\":\"holder\",\"granted_at\":\"2026-01-01T00:00:00Z\"}\n",
+      "blob": "AW4tLqmZ7Vo+6lvXeCIMc+PYtkBN7taztQjHFIeJffzZ83TLnC3p48rjnhQEKalTWBqjOOky3yFJzDLHvORQBW7oxxxQ7P0h1PQwqx3JZuf0CmYnSnAHz00ZPGNWdv/In9Ju0wedWHuCOKr5JryxF6SDx5wxeZWPUo2b4Bza2G/rQLohSq3i"
+    },
+    "identity/did.json": {
+      "plaintext": "{\"did\":\"did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo\",\"method\":\"did:key\"}\n",
+      "blob": "ATtllx3aK/Fi9olBDDXK/UNMYsM9hE+Ii034taPXPUfUUZnDGrvS5R46pmGCKWCc8u605ZNtifiD6t2oDvjK6ZWMN+BgxyOcqZ54tPbrPpRWcPHoor7TenuL10uIBr/KYHynomBkcfxrvhAMR0DV3WJ48A=="
+    },
+    "sessions/demo/000001": {
+      "plaintext": "{\"role\":\"user\",\"text\":\"hello signet\"}\n",
+      "blob": "AV+TJlLBjNv/xhEY06Dkv3sWcbZyCAxiW1ngKya1V+SlATQt9X3QXnVPPOo2fjKVwT638EWjJCRP8eZdR3xZyhYDQg=="
+    },
+    "sessions/demo/000002": {
+      "plaintext": "{\"role\":\"agent\",\"text\":\"state is yours now\"}\n",
+      "blob": "Ae6m+PLBIWA5CFeIJCtK/fU6RbAjJG1MuxllcSyO5V7TuW/EYRjgD1MjrMLdAbSYvKOZMNd29EzWPhzzbeVSuC971fZmmz9huxM="
+    }
+  }
+}

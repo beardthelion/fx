@@ -29,9 +29,9 @@ const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const passport_grant_import = @import("../passport/grant_import.zig");
-const passport_grants = @import("../passport/grants.zig");
-const passport_store_redirect = @import("../passport/store_redirect.zig");
+const signet_grant_import = @import("../signet/grant_import.zig");
+const signet_grants = @import("../signet/grants.zig");
+const signet_store_redirect = @import("../signet/store_redirect.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -800,8 +800,8 @@ pub fn Handlers(comptime App: type) type {
         fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
             const trimmed = std.mem.trim(u8, rest, " \t");
             const action = splitPermissionWord(trimmed) orelse return false;
-            if (std.ascii.eqlIgnoreCase(action.word, "passport")) {
-                try handlePassportGrants(app, action.rest);
+            if (std.ascii.eqlIgnoreCase(action.word, "signet")) {
+                try handleSignetGrants(app, action.rest);
                 return true;
             }
             if (comptime !@hasField(App, "approval_prompt") or
@@ -955,16 +955,16 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        /// `/permissions passport` — list, confirm, or deny grants recorded
-        /// under the passport's grants/ surface. Grant import is always an
+        /// `/permissions signet` — list, confirm, or deny grants recorded
+        /// under the signet's grants/ surface. Grant import is always an
         /// explicit holder action (PS-061): nothing auto-applies, and each
         /// decision is journaled so a grant is never re-presented.
-        fn handlePassportGrants(app: *App, rest: []const u8) !void {
+        fn handleSignetGrants(app: *App, rest: []const u8) !void {
             if (comptime !@hasField(App, "permission_engine")) {
                 try writePermissionManagementNotice(
                     app,
                     .@"error",
-                    "passport grant management needs the permission engine",
+                    "signet grant management needs the permission engine",
                 );
                 return;
             }
@@ -972,26 +972,26 @@ pub fn Handlers(comptime App: type) type {
                 try writePermissionManagementNotice(
                     app,
                     .@"error",
-                    "HOME is not set; cannot reach the passport store",
+                    "HOME is not set; cannot reach the signet store",
                 );
                 return;
             };
-            const owned = passport_store_redirect.openEnabled(app.alloc, home) catch |err| {
+            const owned = signet_store_redirect.openEnabled(app.alloc, home) catch |err| {
                 const body = try std.fmt.allocPrint(
                     app.alloc,
-                    "passport backend unavailable: {s}",
+                    "signet backend unavailable: {s}",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(body);
                 try writePermissionManagementNotice(app, .@"error", body);
                 return;
             };
-            defer if (owned) |ptr| passport_store_redirect.destroyOwned(ptr);
+            defer if (owned) |ptr| signet_store_redirect.destroyOwned(ptr);
             const store = owned orelse {
                 try writePermissionManagementNotice(
                     app,
                     .neutral,
-                    "passport backend is not enabled; nothing to review",
+                    "signet backend is not enabled; nothing to review",
                 );
                 return;
             };
@@ -999,7 +999,7 @@ pub fn Handlers(comptime App: type) type {
             const verb = splitPermissionWord(rest);
             const now_ms = io_mod.milliTimestamp();
             if (verb == null or std.ascii.eqlIgnoreCase(verb.?.word, "list")) {
-                try listPassportGrants(app, store, home, now_ms);
+                try listSignetGrants(app, store, home, now_ms);
                 return;
             }
 
@@ -1012,19 +1012,19 @@ pub fn Handlers(comptime App: type) type {
                 try writePermissionManagementNotice(
                     app,
                     .@"error",
-                    "usage: /permissions passport [list]\n       /permissions passport confirm <grant-id>\n       /permissions passport deny <grant-id>",
+                    "usage: /permissions signet [list]\n       /permissions signet confirm <grant-id>\n       /permissions signet deny <grant-id>",
                 );
                 return;
             }
             debug_trace.logf(
                 "permission",
-                "event=passport_grant_decision id={s} approve={}",
+                "event=signet_grant_decision id={s} approve={}",
                 .{ id, approve },
             );
 
             // Resolve the pending grant without holding the authority
-            // mutex: listing grants may block on the passport backend.
-            const pending = passport_grant_import.listPending(
+            // mutex: listing grants may block on the signet backend.
+            const pending = signet_grant_import.listPending(
                 app.alloc,
                 store,
                 home,
@@ -1032,7 +1032,7 @@ pub fn Handlers(comptime App: type) type {
             ) catch |err| {
                 const body = try std.fmt.allocPrint(
                     app.alloc,
-                    "could not list passport grants: {s}",
+                    "could not list signet grants: {s}",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(body);
@@ -1043,10 +1043,10 @@ pub fn Handlers(comptime App: type) type {
                 for (pending) |*g| g.deinit(app.alloc);
                 app.alloc.free(pending);
             }
-            const target = passport_grant_import.findPending(pending, id) orelse {
+            const target = signet_grant_import.findPending(pending, id) orelse {
                 const body = try std.fmt.allocPrint(
                     app.alloc,
-                    "passport grant {s} is not pending (decided, expired, or unknown)",
+                    "signet grant {s} is not pending (decided, expired, or unknown)",
                     .{id},
                 );
                 defer app.alloc.free(body);
@@ -1062,7 +1062,7 @@ pub fn Handlers(comptime App: type) type {
                     defer if (comptime @hasField(App, "permission_state")) {
                         app.permission_state.authority_mutex.unlock(io_mod.getIo());
                     };
-                    for (passport_grants.mappedToolNames(target.grant.action)) |tool_name| {
+                    for (signet_grants.mappedToolNames(target.grant.action)) |tool_name| {
                         app.permission_engine.allow(
                             app.alloc,
                             tool_name,
@@ -1070,7 +1070,7 @@ pub fn Handlers(comptime App: type) type {
                         ) catch |err| {
                             const body = try std.fmt.allocPrint(
                                 app.alloc,
-                                "could not apply passport grant {s}: {s}",
+                                "could not apply signet grant {s}: {s}",
                                 .{ id, @errorName(err) },
                             );
                             defer app.alloc.free(body);
@@ -1079,7 +1079,7 @@ pub fn Handlers(comptime App: type) type {
                         };
                     }
                 }
-                passport_grant_import.recordDecision(
+                signet_grant_import.recordDecision(
                     app.alloc,
                     home,
                     id,
@@ -1096,7 +1096,7 @@ pub fn Handlers(comptime App: type) type {
                 };
                 const body = try std.fmt.allocPrint(
                     app.alloc,
-                    "applied passport grant {s} for this session",
+                    "applied signet grant {s} for this session",
                     .{id},
                 );
                 defer app.alloc.free(body);
@@ -1104,7 +1104,7 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
 
-            passport_grant_import.recordDecision(
+            signet_grant_import.recordDecision(
                 app.alloc,
                 home,
                 id,
@@ -1121,20 +1121,20 @@ pub fn Handlers(comptime App: type) type {
             };
             const body = try std.fmt.allocPrint(
                 app.alloc,
-                "denied passport grant {s}",
+                "denied signet grant {s}",
                 .{id},
             );
             defer app.alloc.free(body);
             try writePermissionManagementNotice(app, .neutral, body);
         }
 
-        fn listPassportGrants(
+        fn listSignetGrants(
             app: *App,
-            store: *passport_store_redirect.Store,
+            store: *signet_store_redirect.Store,
             home: []const u8,
             now_ms: i64,
         ) !void {
-            const pending = passport_grant_import.listPending(
+            const pending = signet_grant_import.listPending(
                 app.alloc,
                 store,
                 home,
@@ -1142,7 +1142,7 @@ pub fn Handlers(comptime App: type) type {
             ) catch |err| {
                 const body = try std.fmt.allocPrint(
                     app.alloc,
-                    "could not list passport grants: {s}",
+                    "could not list signet grants: {s}",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(body);
@@ -1157,14 +1157,14 @@ pub fn Handlers(comptime App: type) type {
                 try writePermissionManagementNotice(
                     app,
                     .neutral,
-                    "no pending passport grants",
+                    "no pending signet grants",
                 );
                 return;
             }
             var out: std.Io.Writer.Allocating = .init(app.alloc);
             defer out.deinit();
             try out.writer.print(
-                "pending passport grants ({d}):",
+                "pending signet grants ({d}):",
                 .{pending.len},
             );
             for (pending) |g| {
@@ -1198,7 +1198,7 @@ pub fn Handlers(comptime App: type) type {
                 );
             }
             try out.writer.writeAll(
-                "\nconfirm with /permissions passport confirm <grant-id>",
+                "\nconfirm with /permissions signet confirm <grant-id>",
             );
             try writePermissionManagementNotice(app, .neutral, out.written());
         }
@@ -1222,7 +1222,7 @@ pub fn Handlers(comptime App: type) type {
             try writePermissionManagementNotice(
                 app,
                 .@"error",
-                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>\n       /permissions passport [list|confirm <grant-id>|deny <grant-id>]",
+                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>\n       /permissions signet [list|confirm <grant-id>|deny <grant-id>]",
             );
         }
 

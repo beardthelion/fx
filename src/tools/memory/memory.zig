@@ -1,7 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
 const profile_paths = @import("../../core/shared/profile_paths.zig");
-const store_redirect = @import("../../core/passport/store_redirect.zig");
+const store_redirect = @import("../../core/signet/store_redirect.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
@@ -115,7 +115,7 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
 
-    // When the passport backend is enabled the memories surface lives in
+    // When the signet backend is enabled the memories surface lives in
     // the encrypted store; when it is not, every call below takes the same
     // local file path as before. openEnabled returns null when disabled
     // and propagates a misconfigured enabled state rather than falling
@@ -146,8 +146,8 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     }
 
     if (std.mem.eql(u8, action, "clear")) {
-        if (store) |passport| {
-            passport.deleteSurface(alloc, memories_surface) catch return error.MemoryClearFailed;
+        if (store) |signet| {
+            signet.deleteSurface(alloc, memories_surface) catch return error.MemoryClearFailed;
         } else {
             std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -176,7 +176,7 @@ fn saveWithRetry(
     while (true) {
         attempt += 1;
         return saveMemoriesOnce(alloc, store, memories_path, fact_value) catch |err| switch (err) {
-            error.PassportStaleBase => {
+            error.SignetStaleBase => {
                 if (attempt >= stale_base_max_attempts) return err;
                 continue;
             },
@@ -219,7 +219,7 @@ fn loadMemories(alloc: Allocator, store: ?*store_redirect.Store, path: []const u
     errdefer freeMemories(alloc, &list);
 
     var content: []u8 = undefined;
-    if (store != null and store.?.passportEnabled()) {
+    if (store != null and store.?.signetEnabled()) {
         const remote = store.?.readSurface(alloc, memories_surface) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.MemoryStoreUnreadable,
@@ -281,7 +281,7 @@ fn saveMemories(alloc: Allocator, store: ?*store_redirect.Store, path: []const u
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
 
-    if (store != null and store.?.passportEnabled()) {
+    if (store != null and store.?.signetEnabled()) {
         return store.?.writeSurface(alloc, memories_surface, json);
     }
 
@@ -524,7 +524,7 @@ test "memory owner preserves active output behavior" {
     try expectMemoryOutput("{\"action\":\"list\"}", "No saved memories");
 }
 
-const test_server = @import("../../core/passport/test_server.zig");
+const test_server = @import("../../core/signet/test_server.zig");
 
 test "memory save retries a stale base and still lands the fact" {
     const alloc = std.testing.allocator;

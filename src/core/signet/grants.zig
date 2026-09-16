@@ -1,11 +1,11 @@
 //! Grant vocabulary (PS-060..062) and the mapping into fx's action model.
 //!
-//! A passport grant is `{id, action, scope, constraints, granted_by,
+//! A signet grant is `{id, action, scope, constraints, granted_by,
 //! granted_at, expires_at?}` recorded under `grants/`. Grants are NEVER
 //! silently honored across harness boundaries (PS-061): an incoming grant
 //! is mapped onto fx's own tool/permission model and the holder must
 //! confirm before it takes effect. There is no automatic grant-application
-//! path: the holder decides through `/permissions passport`
+//! path: the holder decides through `/permissions signet`
 //! (grant_import.zig), and the only write path for grant records is
 //! `buildGrantRecord` (PS-062).
 
@@ -54,7 +54,7 @@ pub const Grant = struct {
     expires_at: ?[]const u8 = null,
 };
 
-/// How a passport action class lands in fx's tool permission model. The
+/// How a signet action class lands in fx's tool permission model. The
 /// mapped names are the tool names fx's saved rules and session grants key
 /// on (see src/core/permissions/permissions.zig).
 pub const fx_tool_names = struct {

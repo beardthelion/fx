@@ -13,7 +13,7 @@ const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
-const store_redirect = @import("../core/passport/store_redirect.zig");
+const store_redirect = @import("../core/signet/store_redirect.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -807,20 +807,20 @@ fn runtimeFromConfigs(
     return runtime;
 }
 
-/// Test seam: when set, openPassportStore defers to it instead of
-/// resolving passport config from the filesystem. The hook returns a
+/// Test seam: when set, openSignetStore defers to it instead of
+/// resolving signet config from the filesystem. The hook returns a
 /// fresh Store each call so each caller can deinit what it gets.
 var open_store_hook: ?*const fn (
     alloc: Allocator,
     path: []const u8,
 ) anyerror!?store_redirect.Store = null;
 
-/// When the passport backend is enabled the profile mcp.json surface lives
+/// When the signet backend is enabled the profile mcp.json surface lives
 /// in the encrypted store. The home dir is recovered from the canonical
 /// <home>/.fx/mcp.json layout; a null result keeps the local file path.
-/// Misconfigured-but-enabled passport state fails closed instead of falling
+/// Misconfigured-but-enabled signet state fails closed instead of falling
 /// back to the local file.
-fn openPassportStore(alloc: Allocator, path: []const u8) !?store_redirect.Store {
+fn openSignetStore(alloc: Allocator, path: []const u8) !?store_redirect.Store {
     if (open_store_hook) |hook| return hook(alloc, path);
     const fx_dir = std.fs.path.dirname(path) orelse return null;
     const home = store_redirect.homeFromFxPath(fx_dir) orelse return null;
@@ -832,7 +832,7 @@ fn openPassportStore(alloc: Allocator, path: []const u8) !?store_redirect.Store 
 
 pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
     var json_text: []u8 = undefined;
-    var maybe_store = try openPassportStore(alloc, path);
+    var maybe_store = try openSignetStore(alloc, path);
     defer if (maybe_store) |*store| store.deinit();
     if (maybe_store) |*store| {
         const remote = store.readSurface(alloc, mcp_surface) catch |err| {
@@ -933,7 +933,7 @@ fn addOrReplaceServer(
             }
         }
         saveConfigsToPath(alloc, path, document.configs.items) catch |err| switch (err) {
-            error.PassportStaleBase => {
+            error.SignetStaleBase => {
                 if (attempt >= stale_base_max_attempts) return err;
                 continue;
             },
@@ -974,7 +974,7 @@ fn removeProfileServerFromPath(
         }
         if (!found) return .{ .removed = false, .warning = warning };
         saveConfigsToPath(alloc, path, document.configs.items) catch |err| switch (err) {
-            error.PassportStaleBase => {
+            error.SignetStaleBase => {
                 if (attempt >= stale_base_max_attempts) return err;
                 continue;
             },
@@ -997,7 +997,7 @@ fn loadProfileDocumentFromPath(
     path: []const u8,
 ) !project_config.ProfileParseResult {
     var json_text: []u8 = undefined;
-    var maybe_store = try openPassportStore(alloc, path);
+    var maybe_store = try openSignetStore(alloc, path);
     defer if (maybe_store) |*store| store.deinit();
     if (maybe_store) |*store| {
         const remote = try store.readSurface(alloc, mcp_surface);
@@ -1030,7 +1030,7 @@ fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpSer
     const json = try renderConfigJson(alloc, configs);
     defer alloc.free(json);
 
-    var maybe_store = try openPassportStore(alloc, path);
+    var maybe_store = try openSignetStore(alloc, path);
     defer if (maybe_store) |*store| store.deinit();
     if (maybe_store) |*store| {
         return store.writeSurface(alloc, mcp_surface, json);
@@ -2616,7 +2616,7 @@ test "freeConfigs accepts an empty ArrayList" {
     freeConfigs(alloc, &configs);
 }
 
-const test_server = @import("../core/passport/test_server.zig");
+const test_server = @import("../core/signet/test_server.zig");
 
 const HookCtx = struct {
     backend: store_redirect.Backend,
@@ -2624,7 +2624,7 @@ const HookCtx = struct {
 };
 var hook_ctx: ?*HookCtx = null;
 
-fn hookedOpenPassportStore(alloc: Allocator, path: []const u8) anyerror!?store_redirect.Store {
+fn hookedOpenSignetStore(alloc: Allocator, path: []const u8) anyerror!?store_redirect.Store {
     _ = path;
     const ctx = hook_ctx orelse return null;
     return try store_redirect.Store.init(alloc, ctx.home, ctx.backend);
@@ -2649,7 +2649,7 @@ test "profile add retries a stale base and still saves" {
     var ctx = HookCtx{ .backend = flaky.backend(), .home = home };
     hook_ctx = &ctx;
     defer hook_ctx = null;
-    open_store_hook = hookedOpenPassportStore;
+    open_store_hook = hookedOpenSignetStore;
     defer open_store_hook = null;
 
     _ = try addProfileServerToPath(

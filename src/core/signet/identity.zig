@@ -1,16 +1,16 @@
 //! Holder identity: did:key encoding, Ed25519 signing, canonical JSON, and
 //! rotation attestations (PS-001, PS-010/011, PS-050..053).
 //!
-//! A passport is rooted at exactly one genesis DID (PS-010): a `did:key`
+//! A signet is rooted at exactly one genesis DID (PS-010): a `did:key`
 //! Ed25519 identity created at init. The private key is one of the two
-//! secrets that govern the passport (PS-100); it lives client-side only.
+//! secrets that govern the signet (PS-100); it lives client-side only.
 //! What crosses the wire is the DID itself (public), Ed25519 signatures
 //! over server nonces and canonical-JSON documents, and rotation
 //! attestations.
 //!
 //! The DID encoding (PS-001) is `did:key:z` + base58btc(0xed01 || pubkey).
 //! base58btc is implemented locally and matches the reference encoder in
-//! passport-suite (src/client/identity.ts) byte for byte, so the shared
+//! signet-suite (src/client/identity.ts) byte for byte, so the shared
 //! vectors in spec/vectors/{identity,rotation}.json reproduce exactly.
 //!
 //! Signatures are over canonical JSON: object keys sorted at every level,
@@ -133,7 +133,7 @@ pub fn identityFromSeed(alloc: Allocator, seed: [Ed25519.KeyPair.seed_length]u8)
     return .{ .did = did, .key_pair = key_pair, .seed = seed };
 }
 
-/// Generate a fresh Ed25519 identity — the genesis key of a new passport.
+/// Generate a fresh Ed25519 identity — the genesis key of a new signet.
 pub fn generateIdentity(alloc: Allocator) !Identity {
     var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
     while (true) {
@@ -167,7 +167,7 @@ pub fn publicKeyFromDid(alloc: Allocator, did: []const u8) !?Ed25519.PublicKey {
 // ─── Canonical JSON + signatures ────────────────────────────────────────
 
 /// Deterministic JSON: object keys sorted at every level, no whitespace.
-/// Matches JSON.stringify leaf encoding for the value shapes passports
+/// Matches JSON.stringify leaf encoding for the value shapes signets
 /// carry (strings, integers, booleans, null, arrays, objects).
 /// The caller owns the returned slice.
 pub fn canonicalJson(alloc: Allocator, value: std.json.Value) Allocator.Error![]u8 {
@@ -283,19 +283,19 @@ pub fn encodeDid(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
     return out;
 }
 
-/// The namespace a genesis DID owns: `passport:<encoded did>` (PS-011).
+/// The namespace a genesis DID owns: `signet:<encoded did>` (PS-011).
 /// The caller owns the returned slice.
 pub fn namespaceFor(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
     const encoded = try encodeDid(alloc, did);
     defer alloc.free(encoded);
-    return std.fmt.allocPrint(alloc, "passport:{s}", .{encoded});
+    return std.fmt.allocPrint(alloc, "signet:{s}", .{encoded});
 }
 
-/// Inverse of namespaceFor: recover the genesis DID a `passport:` namespace
+/// Inverse of namespaceFor: recover the genesis DID a `signet:` namespace
 /// pins (PS-012). The caller owns the returned slice; null when the
 /// namespace does not decode back to a well-formed did:key identity.
 pub fn didFromNamespace(alloc: Allocator, namespace: []const u8) Allocator.Error!?[]u8 {
-    const prefix = "passport:";
+    const prefix = "signet:";
     if (!std.mem.startsWith(u8, namespace, prefix)) return null;
     const did = try alloc.dupe(u8, namespace[prefix.len..]);
     std.mem.replaceScalar(u8, did, '_', ':');
@@ -308,7 +308,7 @@ pub fn didFromNamespace(alloc: Allocator, namespace: []const u8) Allocator.Error
 
 /// PS-012: encoded namespaces must match this shape before storage access.
 pub fn isValidNamespace(namespace: []const u8) bool {
-    const prefix = "passport:did_";
+    const prefix = "signet:did_";
     if (!std.mem.startsWith(u8, namespace, prefix)) return false;
     const rest = namespace[prefix.len..];
     const sep = std.mem.findScalar(u8, rest, '_') orelse return false;
@@ -510,7 +510,7 @@ test "namespaceFor and encodeDid match the vector namespace" {
     defer alloc.free(ns);
     try std.testing.expectEqualStrings(expected_ns, ns);
     try std.testing.expect(isValidNamespace(ns));
-    try std.testing.expect(!isValidNamespace("passport:did:key:z6Mk"));
+    try std.testing.expect(!isValidNamespace("signet:did:key:z6Mk"));
     try std.testing.expect(!isValidNamespace("other:did_key_z6Mk"));
 
     // Successor DID encodes to a different namespace (PS-053).

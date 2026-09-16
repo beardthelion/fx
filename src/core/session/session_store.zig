@@ -21,7 +21,7 @@ const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
-const session_sync = @import("../passport/session_sync.zig");
+const session_sync = @import("../signet/session_sync.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -958,14 +958,14 @@ pub const Store = struct {
             );
             return .indeterminate;
         };
-        // The passport mirror goes first: if the remote delete fails the
+        // The signet mirror goes first: if the remote delete fails the
         // local tree is still intact, so the session cannot resurrect a
         // deleted-local copy on the next hydrate.
-        if (self.canonical_root.passport) |passport_store| {
-            session_sync.deleteSession(alloc, passport_store, loaded.active_id) catch |err| {
+        if (self.canonical_root.signet) |signet_store| {
+            session_sync.deleteSession(alloc, signet_store, loaded.active_id) catch |err| {
                 debug_trace.logf(
                     "session",
-                    "event={s} disposition=indeterminate stage=passport_delete err={s}",
+                    "event={s} disposition=indeterminate stage=signet_delete err={s}",
                     .{ event_name, @errorName(err) },
                 );
                 return .indeterminate;
@@ -3110,7 +3110,7 @@ pub const Store = struct {
     }
 
     /// Opens a session dir by id like openSessionDir, but hydrates the
-    /// session from the passport mirror first when it is absent locally.
+    /// session from the signet mirror first when it is absent locally.
     /// Hydration runs on a throwaway root copy: a sessions dir
     /// materialized for the lookup is closed again once the session dir
     /// holds its own descriptor. Mirror failures propagate; an unmirrored
@@ -3123,14 +3123,14 @@ pub const Store = struct {
         return self.openSessionDir(session_id) catch |err| switch (err) {
             error.SessionNotFound => blk: {
                 var root = self.canonical_root;
-                if (root.passport == null) return error.SessionNotFound;
+                if (root.signet == null) return error.SessionNotFound;
                 const materialized = root.sessions == null;
-                // Armed before hydrateFromPassport so a hydrate error
+                // Armed before hydrateFromSignet so a hydrate error
                 // cannot leak the materialized dir either.
                 defer if (materialized) {
                     if (root.sessions) |*s| s.close();
                 };
-                if (!try root.hydrateFromPassport(alloc, session_id)) {
+                if (!try root.hydrateFromSignet(alloc, session_id)) {
                     return error.SessionNotFound;
                 }
                 var store = self;
@@ -3942,14 +3942,14 @@ pub const Store = struct {
             options.session_lock_deadline_ms,
         ) catch |err| switch (err) {
             // SessionStoreUnavailable is the read-only root's miss shape:
-            // the session may exist only in the passport mirror.
+            // the session may exist only in the signet mirror.
             error.SessionNotFound, error.SessionStoreUnavailable => blk: {
                 var root = self.canonical_root;
                 const had_sessions = root.sessions != null;
                 defer if (!had_sessions) {
                     if (root.sessions) |*s| s.close();
                 };
-                if (!try root.hydrateFromPassport(alloc, session_id)) {
+                if (!try root.hydrateFromSignet(alloc, session_id)) {
                     return error.SessionNotFound;
                 }
                 // Retry through a copy holding the hydrated root: `self`
@@ -5053,13 +5053,13 @@ fn initWithHome(alloc: Allocator, home: []const u8, workspace_root: []const u8, 
         error.OutOfMemory,
         error.PrivateStatePermissionsUnsupported,
         error.SessionPathUnsafe,
-        // Passport misconfiguration is its own failure class, not a
+        // Signet misconfiguration is its own failure class, not a
         // layout defect: pass it through so an enabled-but-broken
         // backend is diagnosed as itself.
-        error.PassportSecretsMissing,
-        error.PassportUrlMissing,
-        error.PassportNamespaceInvalid,
-        error.PassportStateCorrupt,
+        error.SignetSecretsMissing,
+        error.SignetUrlMissing,
+        error.SignetNamespaceInvalid,
+        error.SignetStateCorrupt,
         => return err,
         else => {
             if (!ensure_layout) return err;

@@ -3,7 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_codec = @import("session_codec.zig");
-const store_redirect = @import("../passport/store_redirect.zig");
+const store_redirect = @import("../signet/store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
 const history_file = profile_paths.prompt_history_file_name;
@@ -58,7 +58,7 @@ const LineRead = struct {
 
 /// Positional byte source for the reverse-scan and rewrite helpers: an
 /// open history file locally, or an in-memory buffer fetched from the
-/// passport backend.
+/// signet backend.
 const ByteSource = struct {
     ctx: *anyopaque,
     lengthFn: *const fn (ctx: *anyopaque) anyerror!u64,
@@ -121,15 +121,15 @@ pub const Store = struct {
     fail_layout_creation: bool = false,
     fail_private_mode: bool = false,
     fail_history_parent_sync: bool = false,
-    /// Live when the passport backend is enabled; owned. The history
+    /// Live when the signet backend is enabled; owned. The history
     /// document routes through it instead of the local file.
-    passport: ?*store_redirect.Store = null,
+    signet: ?*store_redirect.Store = null,
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
         // Misconfigured enabled state propagates rather than silently
         // falling back to a local history file.
-        const passport = try store_redirect.openEnabled(alloc, home_path);
-        errdefer if (passport) |p| store_redirect.destroyOwned(p);
+        const signet = try store_redirect.openEnabled(alloc, home_path);
+        errdefer if (signet) |p| store_redirect.destroyOwned(p);
         const zio = io_mod.getIo();
         var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
         defer home.close(zio);
@@ -153,12 +153,12 @@ pub const Store = struct {
             .home_path = try alloc.dupe(u8, home_path),
             .display_path = try profile_paths.promptHistoryPath(alloc, home_path),
             .durable_home = durable_home,
-            .passport = passport,
+            .signet = signet,
         };
     }
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
-        if (self.passport) |p| store_redirect.destroyOwned(p);
+        if (self.signet) |p| store_redirect.destroyOwned(p);
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.home_path);
         alloc.free(self.display_path);
@@ -177,7 +177,7 @@ pub const Store = struct {
         defer alloc.free(line);
         if (line.len > max_record_bytes) return .record_too_large;
 
-        if (self.passport != null) {
+        if (self.signet != null) {
             return self.appendRemote(alloc, line, workspace_root, text);
         }
 
@@ -227,7 +227,7 @@ pub const Store = struct {
         limit: usize,
     ) ![]LoadedPromptHistoryEntry {
         try validateWorkspaceRoot(workspace_root);
-        if (self.passport) |store| {
+        if (self.signet) |store| {
             if (limit == 0) return alloc.alloc(LoadedPromptHistoryEntry, 0);
             const remote = (try store.readSurface(alloc, history_file)) orelse
                 return alloc.alloc(LoadedPromptHistoryEntry, 0);
@@ -262,7 +262,7 @@ pub const Store = struct {
         workspace_root: []const u8,
     ) !void {
         try validateWorkspaceRoot(workspace_root);
-        if (self.passport) |store| {
+        if (self.signet) |store| {
             const remote = (try store.readSurface(alloc, history_file)) orelse return;
             defer alloc.free(remote);
             const ctx: ByteSource.BytesContext = .{ .bytes = remote };
@@ -438,7 +438,7 @@ pub const Store = struct {
         self.indeterminate = false;
     }
 
-    /// Passport-mode append: read the remote document, repair its tail,
+    /// Signet-mode append: read the remote document, repair its tail,
     /// dedup against the newest record for this workspace, then write one
     /// candidate back. The backend's manifest transaction is the
     /// atomicity boundary, so there is no indeterminate state to resolve.
@@ -456,7 +456,7 @@ pub const Store = struct {
         while (true) {
             attempt += 1;
             return self.appendRemoteOnce(alloc, line, workspace_root, text) catch |err| switch (err) {
-                error.PassportStaleBase => {
+                error.SignetStaleBase => {
                     if (attempt >= stale_base_max_attempts) return err;
                     continue;
                 },
@@ -472,7 +472,7 @@ pub const Store = struct {
         workspace_root: []const u8,
         text: []const u8,
     ) !AppendOutcome {
-        const store = self.passport.?;
+        const store = self.signet.?;
         const existing = (try store.readSurface(alloc, history_file)) orelse
             try alloc.dupe(u8, "");
         defer alloc.free(existing);
@@ -1605,11 +1605,11 @@ test "symlinked durable home is rejected before prompt history reads or writes" 
     try std.testing.expectError(error.DurablePathUnsafe, Store.initFromHome(alloc, home));
 }
 
-// A minimal in-memory backend standing in for the passport backend: every
+// A minimal in-memory backend standing in for the signet backend: every
 // surface is a key→bytes map.
 const RemoteHistoryBackend = store_redirect.MockBackend;
 
-test "passport-backed history appends dedupes loads and clears remotely" {
+test "signet-backed history appends dedupes loads and clears remotely" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1622,10 +1622,10 @@ test "passport-backed history appends dedupes loads and clears remotely" {
 
     var store = try Store.initFromHome(alloc, home);
     defer store.deinit(alloc);
-    // Inject the remote backend the way openPassportStore does.
+    // Inject the remote backend the way openSignetStore does.
     const backend_store = try alloc.create(store_redirect.Store);
     backend_store.* = try store_redirect.Store.init(alloc, home, mock.backend());
-    store.passport = backend_store;
+    store.signet = backend_store;
 
     try std.testing.expectEqual(
         AppendOutcome.appended,
@@ -1676,9 +1676,9 @@ test "passport-backed history appends dedupes loads and clears remotely" {
     try std.testing.expectEqualStrings("other", kept[0].text);
 }
 
-const test_server = @import("../passport/test_server.zig");
+const test_server = @import("../signet/test_server.zig");
 
-test "passport-backed append retries a stale base and keeps the record" {
+test "signet-backed append retries a stale base and keeps the record" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1688,7 +1688,7 @@ test "passport-backed append retries a stale base and keeps the record" {
 
     var mock = RemoteHistoryBackend{};
     defer mock.deinit(alloc);
-    // The first writeSurface answers PassportStaleBase; the bounded retry
+    // The first writeSurface answers SignetStaleBase; the bounded retry
     // re-reads and rewrites instead of dropping the record.
     var flaky = test_server.FlakyBackend{
         .inner = mock.backend(),
@@ -1699,7 +1699,7 @@ test "passport-backed append retries a stale base and keeps the record" {
     defer store.deinit(alloc);
     const backend_store = try alloc.create(store_redirect.Store);
     backend_store.* = try store_redirect.Store.init(alloc, home, flaky.backend());
-    store.passport = backend_store;
+    store.signet = backend_store;
 
     try std.testing.expectEqual(
         AppendOutcome.appended,
@@ -1714,7 +1714,7 @@ test "passport-backed append retries a stale base and keeps the record" {
     try std.testing.expectEqualStrings("first", entries[0].text);
 }
 
-test "passport-backed append gives up after the bounded retries" {
+test "signet-backed append gives up after the bounded retries" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1734,10 +1734,10 @@ test "passport-backed append gives up after the bounded retries" {
     defer store.deinit(alloc);
     const backend_store = try alloc.create(store_redirect.Store);
     backend_store.* = try store_redirect.Store.init(alloc, home, flaky.backend());
-    store.passport = backend_store;
+    store.signet = backend_store;
 
     try std.testing.expectError(
-        error.PassportStaleBase,
+        error.SignetStaleBase,
         store.append(alloc, 1, "/tmp/workspace-a", "first"),
     );
     try std.testing.expect(mock.entries.get("config/history.jsonl") == null);

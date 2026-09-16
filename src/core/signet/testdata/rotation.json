@@ -1,5 +1,5 @@
 {
-  "specVersion": "passport-spec/0.1",
+  "specVersion": "signet-spec/0.1",
   "attestation": {
     "genesisDid": "did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
     "newDid": "did:key:z6MkjsHJ27VECNVM394DimiaZpUzitPHA63iRWLVhj4yxdnN",

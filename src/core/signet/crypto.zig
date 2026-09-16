@@ -1,13 +1,13 @@
-//! Client-side end-to-end encryption for the AI Passport (PS-030..035).
+//! Client-side end-to-end encryption for the AI Signet (PS-030..035).
 //!
 //! This module is the trust boundary made concrete: plaintext is encrypted
 //! here, on the holder's machine, before anything crosses the wire. A
 //! conformant store sees only ciphertext plus the bounded metadata of
 //! PS-034.
 //!
-//! Crypto choices (matches src/client/crypto.ts in passport-suite, and
+//! Crypto choices (matches src/client/crypto.ts in signet-suite, and
 //! spec/vectors/crypto.json byte for byte):
-//!   - Key derivation: scrypt(passphrase, salt = sha256("passport-suite:" +
+//!   - Key derivation: scrypt(passphrase, salt = sha256("signet:" +
 //!     namespace), 32, {N: 2^15, r: 8, p: 1}) (PS-031).
 //!   - Cipher: AES-256-GCM with the entry key as AEAD AAD (PS-032).
 //!   - Nonce: deterministic HMAC-SHA256(encKey, entryKey || 0x00 ||
@@ -28,7 +28,7 @@ pub const nonce_len = Aes256Gcm.nonce_length; // 12
 pub const tag_len = Aes256Gcm.tag_length; // 16
 pub const key_len = Aes256Gcm.key_length; // 32
 pub const scrypt_params: std.crypto.pwhash.scrypt.Params = .{ .ln = 15, .r = 8, .p = 1 };
-pub const salt_prefix = "passport-suite:";
+pub const salt_prefix = "signet:";
 
 pub const Error = error{
     CiphertextTooShort,
@@ -39,7 +39,7 @@ pub const Error = error{
     OutputTooLong,
 };
 
-/// Derive the 32-byte passport key from a passphrase + namespace (PS-031).
+/// Derive the 32-byte signet key from a passphrase + namespace (PS-031).
 pub fn deriveKey(
     alloc: Allocator,
     passphrase: []const u8,

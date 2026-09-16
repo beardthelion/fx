@@ -1,4 +1,4 @@
-//! Zero-knowledge passport store client (SPEC section 7).
+//! Zero-knowledge signet store client (SPEC section 7).
 //!
 //! Wraps crypto, identity, and the HTTP contract so callers work in
 //! plaintext and never touch ciphertext or the wire format. Encryption and
@@ -9,11 +9,11 @@
 //! Wire protocol:
 //!   POST /auth/challenge            -> {nonce, expiresAt}
 //!   POST /auth/verify {did, nonce, sig, attestations?} -> {token, expiresAt}
-//!   GET  /passport/<ns>             -> manifest view
-//!   GET  /passport/<ns>?view=hashes -> {entryKey: sha256-hash}
-//!   GET  /passport/<ns>?view=integrity -> the signed manifest blob
-//!   GET  /passport/<ns>/<entryKey>  -> one ciphertext blob
-//!   PUT  /passport/<ns>             -> {base, entries, deletions?}
+//!   GET  /signet/<ns>             -> manifest view
+//!   GET  /signet/<ns>?view=hashes -> {entryKey: sha256-hash}
+//!   GET  /signet/<ns>?view=integrity -> the signed manifest blob
+//!   GET  /signet/<ns>/<entryKey>  -> one ciphertext blob
+//!   PUT  /signet/<ns>             -> {base, entries, deletions?}
 //!
 //! The transport is injectable so tests can stand up the wire contract
 //! in-process without a socket.
@@ -26,7 +26,7 @@ const secretscan = @import("secretscan.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const spec_version = "passport-spec/0.1";
+pub const spec_version = "signet-spec/0.1";
 
 /// The entry carrying the signed integrity manifest (PS-040).
 pub const manifest_entry_key = "identity/manifest.json";
@@ -129,15 +129,15 @@ pub const HttpTransport = struct {
         select.concurrent(.deadline, Ops.waitDeadline, .{deadline}) catch {
             // No task concurrency on this backend: fail fast rather than
             // let a hostile store hold the request open without a bound.
-            return error.PassportHttpFailed;
+            return error.SignetHttpFailed;
         };
         select.concurrent(.response, Ops.runRequest, .{ self, alloc, req }) catch {
             Ops.drain(alloc, &select);
-            return error.PassportHttpFailed;
+            return error.SignetHttpFailed;
         };
         const event = select.await() catch {
             Ops.drain(alloc, &select);
-            return error.PassportHttpFailed;
+            return error.SignetHttpFailed;
         };
         switch (event) {
             .response => |result| {
@@ -146,13 +146,13 @@ pub const HttpTransport = struct {
             },
             .deadline => {
                 Ops.drain(alloc, &select);
-                return error.PassportHttpFailed;
+                return error.SignetHttpFailed;
             },
         }
     }
 
     fn requestInner(self: *HttpTransport, alloc: Allocator, req: Request) anyerror!Response {
-        const uri = std.Uri.parse(req.url) catch return error.PassportHttpFailed;
+        const uri = std.Uri.parse(req.url) catch return error.SignetHttpFailed;
 
         var http_req = self.client.request(req.method, uri, .{
             .redirect_behavior = .unhandled,
@@ -164,25 +164,25 @@ pub const HttpTransport = struct {
                     .default,
             },
             .extra_headers = req.headers,
-        }) catch return error.PassportHttpFailed;
+        }) catch return error.SignetHttpFailed;
         defer http_req.deinit();
 
         if (req.body) |body| {
-            http_req.sendBodyComplete(@constCast(body)) catch return error.PassportHttpFailed;
+            http_req.sendBodyComplete(@constCast(body)) catch return error.SignetHttpFailed;
         } else if (req.method.requestHasBody()) {
             // POST/PUT/PATCH always carry a body, even an empty one:
             // sendBodiless asserts the method is bodiless.
             var empty: [0]u8 = .{};
-            http_req.sendBodyComplete(&empty) catch return error.PassportHttpFailed;
+            http_req.sendBodyComplete(&empty) catch return error.SignetHttpFailed;
         } else {
-            http_req.sendBodiless() catch return error.PassportHttpFailed;
+            http_req.sendBodiless() catch return error.SignetHttpFailed;
         }
 
         var redirect_buf: [8192]u8 = undefined;
-        var response = http_req.receiveHead(&redirect_buf) catch return error.PassportHttpFailed;
-        if (response.head.status.class() == .redirect) return error.PassportHttpFailed;
+        var response = http_req.receiveHead(&redirect_buf) catch return error.SignetHttpFailed;
+        if (response.head.status.class() == .redirect) return error.SignetHttpFailed;
         if (response.head.content_length) |len| {
-            if (len > max_response_bytes) return error.PassportHttpFailed;
+            if (len > max_response_bytes) return error.SignetHttpFailed;
         }
 
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -191,11 +191,11 @@ pub const HttpTransport = struct {
         const reader = response.reader(&transfer_buf);
         var chunk: [4096]u8 = undefined;
         while (true) {
-            const n = reader.readSliceShort(&chunk) catch return error.PassportHttpFailed;
+            const n = reader.readSliceShort(&chunk) catch return error.SignetHttpFailed;
             if (n == 0) break;
             if (n > max_response_bytes -| out.writer.buffered().len)
-                return error.PassportHttpFailed;
-            out.writer.writeAll(chunk[0..n]) catch return error.PassportHttpFailed;
+                return error.SignetHttpFailed;
+            out.writer.writeAll(chunk[0..n]) catch return error.SignetHttpFailed;
         }
         return .{
             .status = @intFromEnum(response.head.status),
@@ -209,26 +209,26 @@ pub const HttpTransport = struct {
 pub const Error = error{
     /// The store answered with a non-2xx status. `last_error` carries the
     /// server's own error code when it sent one.
-    PassportHttp,
+    SignetHttp,
     /// The signed integrity manifest failed verification or rollback
     /// checks (PS-041). Fail closed.
-    PassportIntegrity,
+    SignetIntegrity,
     /// A blob did not decrypt with this client's key or its hash did not
     /// match the verified manifest.
-    PassportDecrypt,
+    SignetDecrypt,
     /// The server refused some entries of a push (PS-081: skipped, never a
     /// silent drop).
-    PassportSkipped,
+    SignetSkipped,
     /// The request body or response could not be understood.
-    PassportProtocol,
+    SignetProtocol,
     /// The store reports a stale `base` (409): nothing committed.
-    PassportStaleBase,
+    SignetStaleBase,
     /// The persisted anti-rollback cursor could not be parsed (PS-041).
     /// Fail closed: an unreadable cursor must not reset the seq floor.
-    PassportStateCorrupt,
+    SignetStateCorrupt,
     /// The anti-rollback cursor could not be persisted after a verified
     /// manifest adoption.
-    PassportStatePersistFailed,
+    SignetStatePersistFailed,
     /// A pushed entry carried a credential-shaped secret (PS-110).
     SecretFound,
     /// An entry key violated PS-020/021.
@@ -240,7 +240,7 @@ pub const Error = error{
     WeakParameters,
     OutputTooLong,
     OutOfMemory,
-    PassportHttpFailed,
+    SignetHttpFailed,
     IdentityElement,
     KeyMismatch,
     NonCanonical,
@@ -462,7 +462,7 @@ pub const Client = struct {
         key_pair: identity.Ed25519.KeyPair,
         /// DID of the active key.
         did: []const u8,
-        /// The passport's immutable root DID. Defaults to `did`.
+        /// The signet's immutable root DID. Defaults to `did`.
         genesis_did: ?[]const u8 = null,
         /// Explicit namespace override (PS-012): pins a namespace that
         /// differs from the genesis-DID-derived one (post-rotation
@@ -482,7 +482,7 @@ pub const Client = struct {
         /// same-seq manifest swap (PS-041).
         last_manifest_hash: ?[]const u8 = null,
         /// Where the anti-rollback cursor persists ({seq, canonical
-        /// manifest hash}), e.g. ~/.fx/passport/manifest-state.json.
+        /// manifest hash}), e.g. ~/.fx/signet/manifest-state.json.
         /// Null disables persistence (tests, in-memory clients).
         manifest_state_path: ?[]const u8 = null,
     };
@@ -569,7 +569,7 @@ pub const Client = struct {
                 }
             }
         } else |_| {}
-        return error.PassportHttp;
+        return error.SignetHttp;
     }
 
     fn rawRequest(
@@ -586,18 +586,18 @@ pub const Client = struct {
             .body = body,
         }) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.PassportHttpFailed,
+            else => error.SignetHttpFailed,
         };
     }
 
     fn endpointUrl(self: *Client, alloc: Allocator, suffix: []const u8) ![]u8 {
-        return std.fmt.allocPrint(alloc, "{s}/passport/{s}{s}", .{ self.url, self.encoded_namespace, suffix });
+        return std.fmt.allocPrint(alloc, "{s}/signet/{s}{s}", .{ self.url, self.encoded_namespace, suffix });
     }
 
     fn entryUrl(self: *Client, alloc: Allocator, entry_key: []const u8) ![]u8 {
         var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(alloc);
-        try encoded.appendSlice(alloc, "/passport/");
+        try encoded.appendSlice(alloc, "/signet/");
         try encoded.appendSlice(alloc, self.encoded_namespace);
         var it = std.mem.splitScalar(u8, entry_key, '/');
         while (it.next()) |seg| {
@@ -621,19 +621,19 @@ pub const Client = struct {
         if (!challenge.ok()) return self.setHttpError(challenge);
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, challenge.body, .{}) catch
-            return error.PassportProtocol;
+            return error.SignetProtocol;
         defer parsed.deinit();
         const nonce = blk: {
-            if (parsed.value != .object) return error.PassportProtocol;
-            const v = parsed.value.object.get("nonce") orelse return error.PassportProtocol;
-            if (v != .string) return error.PassportProtocol;
+            if (parsed.value != .object) return error.SignetProtocol;
+            const v = parsed.value.object.get("nonce") orelse return error.SignetProtocol;
+            if (v != .string) return error.SignetProtocol;
             break :blk try alloc.dupe(u8, v.string);
         };
         defer alloc.free(nonce);
 
         // The signed preimage is domain-separated so a nonce can never be
         // replayed as some other document's signature (PS-090).
-        const preimage = try std.fmt.allocPrint(alloc, "passport-auth:{s}", .{nonce});
+        const preimage = try std.fmt.allocPrint(alloc, "signet-auth:{s}", .{nonce});
         defer alloc.free(preimage);
         const sig = try identity.signMessage(alloc, &self.key_pair, preimage);
         defer alloc.free(sig);
@@ -678,11 +678,11 @@ pub const Client = struct {
         if (!verified.ok()) return self.setHttpError(verified);
 
         var verify_parsed = std.json.parseFromSlice(std.json.Value, alloc, verified.body, .{}) catch
-            return error.PassportProtocol;
+            return error.SignetProtocol;
         defer verify_parsed.deinit();
-        if (verify_parsed.value != .object) return error.PassportProtocol;
-        const token_v = verify_parsed.value.object.get("token") orelse return error.PassportProtocol;
-        if (token_v != .string) return error.PassportProtocol;
+        if (verify_parsed.value != .object) return error.SignetProtocol;
+        const token_v = verify_parsed.value.object.get("token") orelse return error.SignetProtocol;
+        if (token_v != .string) return error.SignetProtocol;
         const token_value = try alloc.dupe(u8, token_v.string);
         errdefer alloc.free(token_value);
 
@@ -726,7 +726,7 @@ pub const Client = struct {
         return res;
     }
 
-    /// The ?view=hashes map, or null when the passport does not exist yet.
+    /// The ?view=hashes map, or null when the signet does not exist yet.
     /// Keys and values are owned by the caller (freed via freeHashMap).
     fn hashesView(self: *Client) Error!?std.json.ObjectMap {
         const alloc = self.alloc;
@@ -753,15 +753,15 @@ pub const Client = struct {
         if (!res.ok()) return self.setHttpError(res);
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
-            return error.PassportProtocol;
+            return error.SignetProtocol;
         defer parsed.deinit();
-        if (parsed.value != .object) return error.PassportProtocol;
+        if (parsed.value != .object) return error.SignetProtocol;
 
         var map: std.json.ObjectMap = .empty;
         errdefer freeHashMap(alloc, &map);
         var it = parsed.value.object.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.* != .string) return error.PassportProtocol;
+            if (kv.value_ptr.* != .string) return error.SignetProtocol;
             const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
             errdefer alloc.free(owned_key);
             const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
@@ -808,11 +808,11 @@ pub const Client = struct {
         }
         if (!res.ok()) return self.setHttpError(res);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
-            return error.PassportProtocol;
+            return error.SignetProtocol;
         defer parsed.deinit();
-        if (parsed.value != .object) return error.PassportProtocol;
-        const entry_v = parsed.value.object.get("entry") orelse return error.PassportProtocol;
-        if (entry_v != .string) return error.PassportProtocol;
+        if (parsed.value != .object) return error.SignetProtocol;
+        const entry_v = parsed.value.object.get("entry") orelse return error.SignetProtocol;
+        if (entry_v != .string) return error.SignetProtocol;
         return .{ .ok = try alloc.dupe(u8, entry_v.string) };
     }
 
@@ -842,43 +842,43 @@ pub const Client = struct {
     fn verifyManifestBlob(self: *Client, blob: []const u8, enforce_signer: bool) Error!VerifiedManifest {
         const alloc = self.alloc;
         const plaintext = crypto.decryptEntry(alloc, &self.enc_key, manifest_entry_key, blob) catch
-            return error.PassportDecrypt;
+            return error.SignetDecrypt;
         errdefer alloc.free(plaintext);
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, plaintext, .{}) catch
-            return error.PassportIntegrity;
+            return error.SignetIntegrity;
         defer parsed.deinit();
-        if (parsed.value != .object) return error.PassportIntegrity;
+        if (parsed.value != .object) return error.SignetIntegrity;
         const obj = parsed.value.object;
-        const manifest_v = obj.get("manifest") orelse return error.PassportIntegrity;
-        const did_v = obj.get("did") orelse return error.PassportIntegrity;
-        const sig_v = obj.get("sig") orelse return error.PassportIntegrity;
+        const manifest_v = obj.get("manifest") orelse return error.SignetIntegrity;
+        const did_v = obj.get("did") orelse return error.SignetIntegrity;
+        const sig_v = obj.get("sig") orelse return error.SignetIntegrity;
         if (manifest_v != .object or did_v != .string or sig_v != .string)
-            return error.PassportIntegrity;
+            return error.SignetIntegrity;
         const mobj = manifest_v.object;
-        const seq_v = mobj.get("seq") orelse return error.PassportIntegrity;
-        const genesis_v = mobj.get("genesisDid") orelse return error.PassportIntegrity;
-        const entries_v = mobj.get("entries") orelse return error.PassportIntegrity;
-        if (seq_v != .integer or seq_v.integer < 0) return error.PassportIntegrity;
-        if (genesis_v != .string or entries_v != .object) return error.PassportIntegrity;
+        const seq_v = mobj.get("seq") orelse return error.SignetIntegrity;
+        const genesis_v = mobj.get("genesisDid") orelse return error.SignetIntegrity;
+        const entries_v = mobj.get("entries") orelse return error.SignetIntegrity;
+        if (seq_v != .integer or seq_v.integer < 0) return error.SignetIntegrity;
+        if (genesis_v != .string or entries_v != .object) return error.SignetIntegrity;
 
         if (!std.mem.eql(u8, genesis_v.string, self.genesis_did))
-            return error.PassportIntegrity;
+            return error.SignetIntegrity;
         if (enforce_signer and !self.isAuthorizedDid(did_v.string))
-            return error.PassportIntegrity;
+            return error.SignetIntegrity;
 
         const canonical = try identity.canonicalJson(alloc, manifest_v);
         errdefer alloc.free(canonical);
         if (!identity.verifyDidSignature(alloc, did_v.string, canonical, sig_v.string))
-            return error.PassportIntegrity;
+            return error.SignetIntegrity;
 
         const seq: u64 = @intCast(seq_v.integer);
-        if (seq < self.last_seq) return error.PassportIntegrity;
+        if (seq < self.last_seq) return error.SignetIntegrity;
         if (seq == self.last_seq and self.last_manifest_hash != null) {
             const incoming = try identity.sha256Hex(alloc, canonical);
             defer alloc.free(incoming);
             if (!std.mem.eql(u8, incoming, self.last_manifest_hash.?))
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
         }
 
         const signer_did = try alloc.dupe(u8, did_v.string);
@@ -888,7 +888,7 @@ pub const Client = struct {
         errdefer freeHashMap(alloc, &entries);
         var it = entries_v.object.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.* != .string) return error.PassportIntegrity;
+            if (kv.value_ptr.* != .string) return error.SignetIntegrity;
             const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
             errdefer alloc.free(owned_key);
             const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
@@ -935,7 +935,7 @@ pub const Client = struct {
         return .{ .plaintext = plaintext, .canonical = canonical };
     }
 
-    /// Fetch + verify the remote manifest. Null when the passport is empty.
+    /// Fetch + verify the remote manifest. Null when the signet is empty.
     fn remoteManifest(self: *Client) Error!?VerifiedManifest {
         return self.remoteManifestMode(.enforce_signer);
     }
@@ -949,7 +949,7 @@ pub const Client = struct {
             .no_entry => {
                 // Entries exist but nothing signed them — a state this
                 // client never produces. Fail closed rather than build on it.
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
             },
             .ok => |blob| {
                 defer self.alloc.free(blob);
@@ -1062,13 +1062,13 @@ pub const Client = struct {
         defer alloc.free(url);
         const res = try self.request(.PUT, url, body_out.writer.buffered(), false);
         defer alloc.free(res.body);
-        if (res.status == 409) return error.PassportStaleBase;
+        if (res.status == 409) return error.SignetStaleBase;
         if (!res.ok()) return self.setHttpError(res);
 
         var res_parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
-            return error.PassportProtocol;
+            return error.SignetProtocol;
         defer res_parsed.deinit();
-        if (res_parsed.value != .object) return error.PassportProtocol;
+        if (res_parsed.value != .object) return error.SignetProtocol;
 
         var result: CommitDeltaResult = .{};
         errdefer result.deinit(alloc);
@@ -1104,7 +1104,7 @@ pub const Client = struct {
         const alloc = self.alloc;
         if (std.fs.path.dirname(path)) |dir| {
             io_mod.makeDirRecursive(dir) catch
-                return error.PassportStatePersistFailed;
+                return error.SignetStatePersistFailed;
         }
         const body = try std.fmt.allocPrint(
             alloc,
@@ -1114,7 +1114,7 @@ pub const Client = struct {
         defer alloc.free(body);
         io_mod.writeFileAtomic(alloc, path, body) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.PassportStatePersistFailed,
+            else => return error.SignetStatePersistFailed,
         };
     }
 
@@ -1141,14 +1141,14 @@ pub const Client = struct {
             const key = try std.fmt.allocPrint(alloc, "identity/rotations/{d}.json", .{seq});
             defer alloc.free(key);
             const expected = remote.entries.get(key) orelse break;
-            if (expected != .string) return error.PassportIntegrity;
+            if (expected != .string) return error.SignetIntegrity;
             const doc = try self.readVerifiedEntry(alloc, key, expected.string);
             defer alloc.free(doc);
             var att = try parseRotationAttestation(alloc, doc);
             errdefer freeAttestation(alloc, &att);
-            if (att.seq != seq) return error.PassportIntegrity;
+            if (att.seq != seq) return error.SignetIntegrity;
             if (!std.mem.eql(u8, att.genesis_did, self.genesis_did))
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
             const signer: []const u8 = if (seq == 1)
                 self.genesis_did
             else
@@ -1162,14 +1162,14 @@ pub const Client = struct {
                 break :blk owned_prev.?;
             };
             if (!std.mem.eql(u8, att.prev_hash, expected_prev))
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
             if (!identity.verifyRotationAttestation(alloc, att, signer))
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
             try chain.append(alloc, att);
         }
 
         if (!self.signerAuthorizedWithChain(remote.signer_did, chain.items))
-            return error.PassportIntegrity;
+            return error.SignetIntegrity;
         try self.adoptManifest(remote);
         return try chain.toOwnedSlice(alloc);
     }
@@ -1192,11 +1192,11 @@ pub const Client = struct {
 
     // ─── Public operations ──────────────────────────────────────────────
 
-    /// Publish a new passport: identity/did.json plus the first signed
+    /// Publish a new signet: identity/did.json plus the first signed
     /// integrity manifest. Refuses against a namespace that already holds
-    /// a passport.
-    pub fn initPassport(self: *Client) Error!PushResult {
-        if (try self.hashesView() != null) return error.PassportProtocol;
+    /// a signet.
+    pub fn initSignet(self: *Client) Error!PushResult {
+        if (try self.hashesView() != null) return error.SignetProtocol;
         const doc = try didDocument(self.alloc, self.genesis_did);
         defer self.alloc.free(doc);
         const entries = [_]Entry{.{ .key = "identity/did.json", .plaintext = doc }};
@@ -1276,18 +1276,18 @@ pub const Client = struct {
                 while (vit.next()) |kv| {
                     if (std.mem.eql(u8, kv.key_ptr.*, manifest_entry_key)) continue;
                     view_count += 1;
-                    if (kv.value_ptr.* != .string) return error.PassportIntegrity;
+                    if (kv.value_ptr.* != .string) return error.SignetIntegrity;
                     const expected = if (remote_opt) |r|
                         r.entries.get(kv.key_ptr.*)
                     else
                         null;
                     if (expected == null or expected.? != .string or
                         !std.mem.eql(u8, expected.?.string, kv.value_ptr.string))
-                        return error.PassportIntegrity;
+                        return error.SignetIntegrity;
                 }
             }
             const verified_count = if (remote_opt) |r| r.entries.count() else 0;
-            if (view_count != verified_count) return error.PassportIntegrity;
+            if (view_count != verified_count) return error.SignetIntegrity;
         }
 
         var to_upload: std.json.ObjectMap = .empty;
@@ -1469,7 +1469,7 @@ pub const Client = struct {
         // did not commit.
         var delta2 = try self.commitDelta(alloc, &post_map, &manifest_map, &.{});
         defer delta2.deinit(alloc);
-        if (delta2.skipped.items.len > 0) return error.PassportSkipped;
+        if (delta2.skipped.items.len > 0) return error.SignetSkipped;
 
         try self.adoptLocalManifest(seq, signed_manifest.canonical);
 
@@ -1494,7 +1494,7 @@ pub const Client = struct {
             uploaded = kept;
             kept = .empty;
         }
-        if (delta.skipped.items.len > 0) return error.PassportSkipped;
+        if (delta.skipped.items.len > 0) return error.SignetSkipped;
 
         return .{
             .namespace = self.namespace,
@@ -1544,23 +1544,23 @@ pub const Client = struct {
             if (!res.ok()) return self.setHttpError(res);
 
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
-                return error.PassportProtocol;
+                return error.SignetProtocol;
             defer parsed.deinit();
-            if (parsed.value != .object) return error.PassportIntegrity;
+            if (parsed.value != .object) return error.SignetIntegrity;
             const entry_v = parsed.value.object.get("entry") orelse
-                return error.PassportIntegrity;
-            if (entry_v != .string) return error.PassportIntegrity;
+                return error.SignetIntegrity;
+            if (entry_v != .string) return error.SignetIntegrity;
             if (parsed.value.object.get("hash")) |hash_v| {
                 if (hash_v != .string or !std.mem.eql(u8, hash_v.string, expected_hash))
-                    return error.PassportIntegrity;
+                    return error.SignetIntegrity;
             }
             const actual_hash = try crypto.ciphertextHash(alloc, entry_v.string);
             defer alloc.free(actual_hash);
             if (!std.mem.eql(u8, actual_hash, expected_hash))
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
 
             const text = crypto.decryptEntry(alloc, &self.enc_key, entry_key, entry_v.string) catch
-                return error.PassportDecrypt;
+                return error.SignetDecrypt;
             errdefer alloc.free(text);
             const key_copy = try alloc.dupe(u8, entry_key);
             errdefer alloc.free(key_copy);
@@ -1569,7 +1569,7 @@ pub const Client = struct {
                 .plaintext = text,
             });
         }
-        // The manifest itself is passport state too.
+        // The manifest itself is signet state too.
         {
             const key_copy = try alloc.dupe(u8, manifest_entry_key);
             errdefer alloc.free(key_copy);
@@ -1588,7 +1588,7 @@ pub const Client = struct {
         };
     }
 
-    /// The ?view=hashes map as an entry list. Empty when the passport does
+    /// The ?view=hashes map as an entry list. Empty when the signet does
     /// not exist yet.
     /// Caller owns the returned slice and its strings.
     pub fn hashes(self: *Client) Error![]Entry {
@@ -1632,24 +1632,24 @@ pub const Client = struct {
         defer alloc.free(res.body);
         if (!res.ok()) return self.setHttpError(res);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
-            return error.PassportProtocol;
+            return error.SignetProtocol;
         defer parsed.deinit();
-        if (parsed.value != .object) return error.PassportIntegrity;
-        const entry_v = parsed.value.object.get("entry") orelse return error.PassportIntegrity;
-        if (entry_v != .string) return error.PassportIntegrity;
+        if (parsed.value != .object) return error.SignetIntegrity;
+        const entry_v = parsed.value.object.get("entry") orelse return error.SignetIntegrity;
+        if (entry_v != .string) return error.SignetIntegrity;
         if (parsed.value.object.get("hash")) |hash_v| {
             if (hash_v != .string or !std.mem.eql(u8, hash_v.string, expected_hash))
-                return error.PassportIntegrity;
+                return error.SignetIntegrity;
         }
         const actual_hash = try crypto.ciphertextHash(alloc, entry_v.string);
         defer alloc.free(actual_hash);
-        if (!std.mem.eql(u8, actual_hash, expected_hash)) return error.PassportIntegrity;
+        if (!std.mem.eql(u8, actual_hash, expected_hash)) return error.SignetIntegrity;
         return crypto.decryptEntry(alloc, &self.enc_key, entry_key, entry_v.string) catch
-            error.PassportDecrypt;
+            error.SignetDecrypt;
     }
 
     /// Read and decrypt one entry, verified against the signed manifest
-    /// (PS-041). Returns null when the passport does not exist or the
+    /// (PS-041). Returns null when the signet does not exist or the
     /// manifest does not name the key.
     pub fn readEntry(self: *Client, entry_key: []const u8) Error!?[]u8 {
         const alloc = self.alloc;
@@ -1663,7 +1663,7 @@ pub const Client = struct {
 
     /// Read several entries under one manifest fetch+verify instead of
     /// one per entry. results[i] answers entry_keys[i]: null when the
-    /// passport does not exist or the manifest does not name the key,
+    /// signet does not exist or the manifest does not name the key,
     /// the same contract as readEntry. Caller owns the slice and each
     /// non-null element.
     pub fn readEntries(self: *Client, alloc: Allocator, entry_keys: []const []const u8) Error![]?[]u8 {
@@ -1750,21 +1750,21 @@ fn freeAttestation(alloc: Allocator, att: *identity.RotationAttestation) void {
 fn parseRotationAttestation(
     alloc: Allocator,
     doc: []const u8,
-) error{ OutOfMemory, PassportIntegrity }!identity.RotationAttestation {
+) error{ OutOfMemory, SignetIntegrity }!identity.RotationAttestation {
     const trimmed = std.mem.trimEnd(u8, doc, " \t\r\n");
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch
-        return error.PassportIntegrity;
+        return error.SignetIntegrity;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.PassportIntegrity;
+    if (parsed.value != .object) return error.SignetIntegrity;
     const obj = parsed.value.object;
-    const genesis_v = obj.get("genesisDid") orelse return error.PassportIntegrity;
-    const new_v = obj.get("newDid") orelse return error.PassportIntegrity;
-    const seq_v = obj.get("seq") orelse return error.PassportIntegrity;
-    const prev_v = obj.get("prevHash") orelse return error.PassportIntegrity;
-    const sig_v = obj.get("sig") orelse return error.PassportIntegrity;
+    const genesis_v = obj.get("genesisDid") orelse return error.SignetIntegrity;
+    const new_v = obj.get("newDid") orelse return error.SignetIntegrity;
+    const seq_v = obj.get("seq") orelse return error.SignetIntegrity;
+    const prev_v = obj.get("prevHash") orelse return error.SignetIntegrity;
+    const sig_v = obj.get("sig") orelse return error.SignetIntegrity;
     if (genesis_v != .string or new_v != .string or prev_v != .string or
         sig_v != .string or seq_v != .integer or seq_v.integer < 0)
-        return error.PassportIntegrity;
+        return error.SignetIntegrity;
     var att: identity.RotationAttestation = .{
         .genesis_did = try alloc.dupe(u8, genesis_v.string),
         .new_did = try alloc.dupe(u8, new_v.string),
@@ -1802,9 +1802,9 @@ test "entry key validation enforces PS-020/021" {
 
 test "urlEncodeSegment leaves entry-key characters and encodes colons" {
     const alloc = std.testing.allocator;
-    const encoded = try urlEncodeSegment(alloc, "passport:did_key_z6Mk");
+    const encoded = try urlEncodeSegment(alloc, "signet:did_key_z6Mk");
     defer alloc.free(encoded);
-    try std.testing.expectEqualStrings("passport%3Adid_key_z6Mk", encoded);
+    try std.testing.expectEqualStrings("signet%3Adid_key_z6Mk", encoded);
     const plain = try urlEncodeSegment(alloc, "settings.json");
     defer alloc.free(plain);
     try std.testing.expectEqualStrings("settings.json", plain);
@@ -1921,7 +1921,7 @@ const WireFixture = struct {
         self.id = try identity.identityFromSeed(alloc, test_seed);
         self.server = test_server.Server.init(alloc);
         self.client = try Client.init(alloc, self.server.transport(), .{
-            .url = "http://passport.test",
+            .url = "http://signet.test",
             .key_pair = self.id.key_pair,
             .did = self.id.did,
             .passphrase = test_passphrase,
@@ -1988,7 +1988,7 @@ test "auth signs the domain-separated nonce preimage" {
     const sig = obj.get("sig").?.string;
     try std.testing.expectEqualStrings("test-nonce-1", nonce);
 
-    const preimage = try std.fmt.allocPrint(alloc, "passport-auth:{s}", .{nonce});
+    const preimage = try std.fmt.allocPrint(alloc, "signet-auth:{s}", .{nonce});
     defer alloc.free(preimage);
     // The signature verifies against the domain-separated preimage and
     // never against the bare nonce.
@@ -2040,7 +2040,7 @@ test "push fails closed when the hashes view diverges from the verified manifest
         try f.seedSignedEntry(alloc, "memory/old.md", "old contents");
         f.server.tamper = tamper;
         try std.testing.expectError(
-            error.PassportIntegrity,
+            error.SignetIntegrity,
             f.client.push(&upload, &.{}),
         );
     }
@@ -2056,7 +2056,7 @@ test "manifest seq floor and same-seq hash check fail closed" {
         defer f.deinit(alloc);
         try f.seedSignedEntry(alloc, "memory/a.md", "a");
         f.client.last_seq = 5;
-        try std.testing.expectError(error.PassportIntegrity, f.client.pull());
+        try std.testing.expectError(error.SignetIntegrity, f.client.pull());
     }
 
     // Same seq, different canonical manifest: rejected by the hash check.
@@ -2094,7 +2094,7 @@ test "manifest seq floor and same-seq hash check fail closed" {
         if (f.server.integrity_blob) |old| alloc.free(old);
         f.server.integrity_blob = try alloc.dupe(u8, swapped.blob);
 
-        try std.testing.expectError(error.PassportIntegrity, f.client.pull());
+        try std.testing.expectError(error.SignetIntegrity, f.client.pull());
     }
 }
 
@@ -2106,7 +2106,7 @@ test "manifest-state cursor persists and reloads across clients" {
     defer alloc.free(home);
     const state_path = try std.fs.path.join(
         alloc,
-        &.{ home, "passport", "manifest-state.json" },
+        &.{ home, "signet", "manifest-state.json" },
     );
     defer alloc.free(state_path);
 
@@ -2124,7 +2124,7 @@ test "manifest-state cursor persists and reloads across clients" {
     // The cursor file holds the committed seq and canonical hash.
     var file = try tmp.dir.openFile(
         std.testing.io,
-        "passport/manifest-state.json",
+        "signet/manifest-state.json",
         .{},
     );
     const body = try io_mod.readFileToEnd(alloc, &file, 4096);
@@ -2147,7 +2147,7 @@ test "manifest-state cursor persists and reloads across clients" {
     f.server.namespace_missing = false;
 
     var client2 = try Client.init(alloc, f.server.transport(), .{
-        .url = "http://passport.test",
+        .url = "http://signet.test",
         .key_pair = f.id.key_pair,
         .did = f.id.did,
         .passphrase = test_passphrase,
@@ -2180,5 +2180,5 @@ test "manifest-state cursor persists and reloads across clients" {
     defer alloc.free(swapped.blob);
     alloc.free(f.server.integrity_blob.?);
     f.server.integrity_blob = try alloc.dupe(u8, swapped.blob);
-    try std.testing.expectError(error.PassportIntegrity, client2.pull());
+    try std.testing.expectError(error.SignetIntegrity, client2.pull());
 }

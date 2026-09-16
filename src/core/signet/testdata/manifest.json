@@ -1,0 +1,18 @@
+{
+  "specVersion": "signet-spec/0.1",
+  "manifest": {
+    "seq": 1,
+    "specVersion": "signet-spec/0.1",
+    "genesisDid": "did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo",
+    "entries": {
+      "memory/MEMORY.md": "sha256:fad573683873de67f76bcc751d4bb4451ec9c120fa88a1d20863e603479c741c",
+      "config/settings.json": "sha256:1f80d674aa206bcd35d2b621ffd68fe0f03c13a65cc27cb09aa37b7a75c7d5f4",
+      "grants/grant-001.json": "sha256:ea2faab4475af2d0e397acc3f6abf0a4af992ad656c8c12dd945fcba1e8ad5d9",
+      "identity/did.json": "sha256:6f6361b7379db90774b912bf2d893f64655f8c954b56fe8ef22eafb2bd89aa98",
+      "sessions/demo/000001": "sha256:d96575866dbc3af50ed30795846247a97da0e631f4b841e2bcc964f6d5aa9d41",
+      "sessions/demo/000002": "sha256:2e934a9e3a3eeaa5851f142a38ce24c0332bdaba4f4bf8e8b28501e9aea551d6"
+    }
+  },
+  "signature": "w1n3MBHN6R6/8d9GWUv20xOTkYIhtSkn/0CSs29VME1sRlRHoksjLPcjGR9A0kIiakbqI6NH7Gdj0u4PZ6wXAw==",
+  "signer": "did:key:z6MkgS2Bw3AAcdKGv49W3z5E7aYxHgkRQHzG9Sp8Pu5C3Aoo"
+}
