@@ -55,7 +55,7 @@ const write_file_description =
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
 const memory_description =
-    "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
+    "Save, list, or clear durable user preferences for future fx sessions, or record a typed learning with the learn action. When to use: the user explicitly asks to remember, forget, save, or recall a preference; use learn when the session surfaces a durable user preference, correction, project decision, or external reference worth keeping. When NOT to use: store task notes, secrets, temporary context, or anything the user did not ask to persist.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -736,8 +736,12 @@ pub const memory = ToolSpec{
         .description = memory_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "list", "clear" } }, .description = "Action to perform." },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "list", "clear", "learn" } }, .description = "Action to perform." },
                 .{ .name = "fact", .json_type = .string, .description = "Fact to save (required for save action)." },
+                .{ .name = "type", .json_type = .string, .shape = &.{ .enum_values = &.{ "user", "feedback", "project", "reference" } }, .description = "Learning type (required for learn action)." },
+                .{ .name = "title", .json_type = .string, .description = "One-line summary (required for learn action)." },
+                .{ .name = "body", .json_type = .string, .description = "The learning content (required for learn action)." },
+                .{ .name = "slug", .json_type = .string, .description = "Optional kebab-case slug; derived from title when absent." },
             },
             .required = &.{"action"},
         },
@@ -2205,7 +2209,7 @@ test "built-in memory owns product metadata schema and callbacks" {
     try std.testing.expectEqualStrings("memory", memory.name);
     try std.testing.expect(std.mem.find(u8, memory.description, "durable user preferences") != null);
     try std.testing.expect(std.mem.find(u8, memory.description, "anything the user did not ask to persist") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"action\":{\"type\":\"string\",\"enum\":[\"save\",\"list\",\"clear\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"action\":{\"type\":\"string\",\"enum\":[\"save\",\"list\",\"clear\",\"learn\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"fact\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.memory, memory.executor_kind);

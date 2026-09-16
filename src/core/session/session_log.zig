@@ -16,6 +16,7 @@ const session_resume_view = @import("session_resume_view.zig");
 const session_usage = @import("session_usage.zig");
 const session_usage_sidecar = @import("session_usage_sidecar.zig");
 const session_sync = @import("../signet/session_sync.zig");
+const signet_distill = @import("../signet/distill.zig");
 const signet_learn = @import("../signet/learn.zig");
 const store_redirect = @import("../signet/store_redirect.zig");
 
@@ -572,6 +573,19 @@ pub const LoadedWritableSession = struct {
         // capture failure is traced, never propagated, and the local
         // session teardown proceeds regardless.
         if (self.signet) |store| {
+            if (store.signetEnabled()) {
+                signet_distill.emitSessionLearnings(
+                    alloc,
+                    &self.log.dir,
+                    self.state.history,
+                ) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "event=signet_learn_emit_failed session={s} err={s}",
+                        .{ self.active_id, @errorName(err) },
+                    );
+                };
+            }
             signet_learn.captureSessionEnd(alloc, store, &self.log.dir) catch |err| {
                 debug_trace.logf(
                     "session",

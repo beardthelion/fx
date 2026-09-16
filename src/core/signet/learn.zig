@@ -34,7 +34,7 @@ const Allocator = std.mem.Allocator;
 const learnings_file = "learnings.jsonl";
 const provenance = "learned:fx";
 
-const max_learnings_bytes: usize = 256 * 1024;
+pub const max_learnings_bytes: usize = 256 * 1024;
 const max_learnings: usize = 64;
 const max_title_bytes: usize = 512;
 const max_body_bytes: usize = 64 * 1024;
@@ -61,7 +61,7 @@ const Rendered = struct {
     }
 };
 
-fn isLearningType(t: []const u8) bool {
+pub fn isLearningType(t: []const u8) bool {
     for (learning_types) |w| {
         if (std.mem.eql(u8, t, w)) return true;
     }
@@ -153,7 +153,7 @@ fn render(alloc: Allocator, learning: Learning) Allocator.Error!?Rendered {
     return .{ .key = key, .content = content };
 }
 
-fn readLearningsFile(
+pub fn readLearningsFile(
     alloc: Allocator,
     session_dir: *const io_mod.VerifiedDir,
 ) !?[]u8 {
