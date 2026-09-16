@@ -807,15 +807,23 @@ fn runtimeFromConfigs(
     return runtime;
 }
 
+/// Test seam: when set, openPassportStore defers to it instead of
+/// resolving passport config from the filesystem. The hook returns a
+/// fresh Store each call so each caller can deinit what it gets.
+var open_store_hook: ?*const fn (
+    alloc: Allocator,
+    path: []const u8,
+) anyerror!?store_redirect.Store = null;
+
 /// When the passport backend is enabled the profile mcp.json surface lives
 /// in the encrypted store. The home dir is recovered from the canonical
 /// <home>/.fx/mcp.json layout; a null result keeps the local file path.
 /// Misconfigured-but-enabled passport state fails closed instead of falling
 /// back to the local file.
 fn openPassportStore(alloc: Allocator, path: []const u8) !?store_redirect.Store {
+    if (open_store_hook) |hook| return hook(alloc, path);
     const fx_dir = std.fs.path.dirname(path) orelse return null;
-    if (!std.mem.eql(u8, std.fs.path.basename(fx_dir), profile_paths.root_dir_name)) return null;
-    const home = std.fs.path.dirname(fx_dir) orelse return null;
+    const home = store_redirect.homeFromFxPath(fx_dir) orelse return null;
     const ptr = (try store_redirect.openEnabled(alloc, home)) orelse return null;
     // The caller keeps the Store by value; only the container is freed.
     defer alloc.destroy(ptr);
@@ -875,36 +883,64 @@ fn addProfileServerToPath(
     return addOrReplaceServer(alloc, path, next);
 }
 
+/// Read->merge->write retries on a stale-base verdict.
+const stale_base_max_attempts: u8 = 3;
+
+/// A deep copy of `config` owned by one merge attempt's document: each
+/// attempt's document releases its copy on deinit. The render/parse
+/// round trip copies exactly the fields the save path persists.
+fn dupeServerConfigForMerge(alloc: Allocator, config: McpServerConfig) !McpServerConfig {
+    const json = try renderConfigJson(alloc, &.{config});
+    defer alloc.free(json);
+    var parsed = try project_config.parseProfileJson(alloc, json);
+    errdefer freeConfigs(alloc, &parsed);
+    if (parsed.items.len != 1) return error.McpConfigParseFailed;
+    const copy = parsed.items[0];
+    parsed.deinit(alloc);
+    return copy;
+}
+
 fn addOrReplaceServer(
     alloc: Allocator,
     path: []const u8,
     next_value: McpServerConfig,
 ) !?project_config.ProfileDiagnostic {
     var next = next_value;
-    var moved = false;
-    errdefer if (!moved) next.deinit(alloc);
+    defer next.deinit(alloc);
 
     var lock = try acquireProfileMutationLock(path);
     defer lock.release();
-    var document = try loadProfileDocumentFromPath(alloc, path);
-    defer document.deinit(alloc);
-    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
-    const configs = &document.configs;
-    const warning = document.diagnostic;
-
-    for (configs.items) |*existing| {
-        if (!std.mem.eql(u8, existing.name, next.name)) continue;
-        existing.deinit(alloc);
-        existing.* = next;
-        moved = true;
-        try saveConfigsToPath(alloc, path, configs.items);
+    // A stale-base verdict means the remote moved under the
+    // read->merge->write cycle; retry the whole cycle, bounded, so a
+    // concurrent writer does not silently drop this add.
+    var attempt: u8 = 0;
+    while (true) {
+        attempt += 1;
+        var document = try loadProfileDocumentFromPath(alloc, path);
+        defer document.deinit(alloc);
+        if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
+        const warning = document.diagnostic;
+        {
+            var trial = try dupeServerConfigForMerge(alloc, next);
+            errdefer trial.deinit(alloc);
+            for (document.configs.items) |*existing| {
+                if (!std.mem.eql(u8, existing.name, next.name)) continue;
+                existing.deinit(alloc);
+                existing.* = trial;
+                break;
+            } else {
+                try document.configs.append(alloc, trial);
+            }
+        }
+        saveConfigsToPath(alloc, path, document.configs.items) catch |err| switch (err) {
+            error.PassportStaleBase => {
+                if (attempt >= stale_base_max_attempts) return err;
+                continue;
+            },
+            else => |e| return e,
+        };
         return warning;
     }
-
-    try configs.append(alloc, next);
-    moved = true;
-    try saveConfigsToPath(alloc, path, configs.items);
-    return warning;
 }
 
 const ProfileRemoveFromPathResult = struct {
@@ -919,21 +955,33 @@ fn removeProfileServerFromPath(
 ) !ProfileRemoveFromPathResult {
     var lock = try acquireProfileMutationLock(path);
     defer lock.release();
-    var document = try loadProfileDocumentFromPath(alloc, path);
-    defer document.deinit(alloc);
-    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
-    const configs = &document.configs;
-    const warning = document.diagnostic;
-
-    for (configs.items, 0..) |config, i| {
-        if (!std.mem.eql(u8, config.name, name)) continue;
-        var removed = configs.orderedRemove(i);
-        removed.deinit(alloc);
-        try saveConfigsToPath(alloc, path, configs.items);
+    // Same bounded retry as addOrReplaceServer: a stale base re-reads
+    // and re-applies the removal against fresh remote state.
+    var attempt: u8 = 0;
+    while (true) {
+        attempt += 1;
+        var document = try loadProfileDocumentFromPath(alloc, path);
+        defer document.deinit(alloc);
+        if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
+        const warning = document.diagnostic;
+        var found = false;
+        for (document.configs.items, 0..) |config, i| {
+            if (!std.mem.eql(u8, config.name, name)) continue;
+            var removed = document.configs.orderedRemove(i);
+            removed.deinit(alloc);
+            found = true;
+            break;
+        }
+        if (!found) return .{ .removed = false, .warning = warning };
+        saveConfigsToPath(alloc, path, document.configs.items) catch |err| switch (err) {
+            error.PassportStaleBase => {
+                if (attempt >= stale_base_max_attempts) return err;
+                continue;
+            },
+            else => |e| return e,
+        };
         return .{ .removed = true, .warning = warning };
     }
-
-    return .{ .removed = false, .warning = warning };
 }
 
 fn removeServerFromPath(alloc: Allocator, path: []const u8, name: []const u8) !bool {
@@ -2566,4 +2614,64 @@ test "freeConfigs accepts an empty ArrayList" {
     const alloc = std.testing.allocator;
     var configs: std.ArrayList(McpServerConfig) = .empty;
     freeConfigs(alloc, &configs);
+}
+
+const test_server = @import("../core/passport/test_server.zig");
+
+const HookCtx = struct {
+    backend: store_redirect.Backend,
+    home: []const u8,
+};
+var hook_ctx: ?*HookCtx = null;
+
+fn hookedOpenPassportStore(alloc: Allocator, path: []const u8) anyerror!?store_redirect.Store {
+    _ = path;
+    const ctx = hook_ctx orelse return null;
+    return try store_redirect.Store.init(alloc, ctx.home, ctx.backend);
+}
+
+test "profile add retries a stale base and still saves" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const path = try configPathFromHome(alloc, home);
+    defer alloc.free(path);
+
+    var mock = store_redirect.MockBackend{};
+    defer mock.deinit(alloc);
+    var flaky = test_server.FlakyBackend{
+        .inner = mock.backend(),
+        .stale_writes_left = 1,
+    };
+    var ctx = HookCtx{ .backend = flaky.backend(), .home = home };
+    hook_ctx = &ctx;
+    defer hook_ctx = null;
+    open_store_hook = hookedOpenPassportStore;
+    defer open_store_hook = null;
+
+    _ = try addProfileServerToPath(
+        alloc,
+        path,
+        try command_provider_contract.parseAddIntent(&.{ "everything", "npx", "-y", "server-everything" }),
+    );
+
+    // The retried write landed remotely; nothing touched the local file.
+    const remote = mock.entries.get("config/mcp.json") orelse
+        return error.TestExpectedRemoteMcp;
+    try std.testing.expect(std.mem.find(u8, remote, "everything") != null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}),
+    );
+
+    var configs = try loadConfigFromPath(alloc, path);
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    try std.testing.expectEqualStrings("everything", configs.items[0].name);
+
+    try std.testing.expect(try removeServerFromPath(alloc, path, "everything"));
+    try std.testing.expect(mock.entries.get("config/mcp.json") != null);
 }

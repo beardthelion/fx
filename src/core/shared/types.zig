@@ -1161,6 +1161,30 @@ fn daysFromCivil(year_value: u32, month_value: u32, day_value: u32) i64 {
     return era * 146097 + day_of_era - 719468;
 }
 
+/// The inverse of parseGatewayTimestamp: "YYYY-MM-DDTHH:MM:SSZ" for an
+/// epoch-millis instant. Negative (pre-1970) input clamps to the epoch;
+/// the callers' timestamps are wall-clock and never negative.
+pub fn formatGatewayTimestampZ(alloc: std.mem.Allocator, ms: i64) ![]u8 {
+    const epoch_secs: std.time.epoch.EpochSeconds = .{
+        .secs = @intCast(@max(0, @divFloor(ms, 1000))),
+    };
+    const year_day = epoch_secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch_secs.getDaySeconds();
+    return std.fmt.allocPrint(
+        alloc,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{
+            @as(u64, year_day.year),
+            @as(u64, month_day.month.numeric()),
+            @as(u64, month_day.day_index + 1),
+            @as(u64, day_secs.getHoursIntoDay()),
+            @as(u64, day_secs.getMinutesIntoHour()),
+            @as(u64, day_secs.getSecondsIntoMinute()),
+        },
+    );
+}
+
 pub fn validGatewayGenerationId(id: []const u8) bool {
     if (id.len != 30 or !std.mem.startsWith(u8, id, "gen_")) return false;
     for (id[4..]) |char| switch (char) {

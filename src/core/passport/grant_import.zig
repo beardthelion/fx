@@ -17,7 +17,9 @@
 const std = @import("std");
 const grants = @import("grants.zig");
 const io_mod = @import("../shared/io.zig");
+const shared_types = @import("../shared/types.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const store_redirect = @import("store_redirect.zig");
 
 const Allocator = std.mem.Allocator;
@@ -220,45 +222,23 @@ pub fn findPending(pending: []grants.GrantDoc, id: []const u8) ?*grants.GrantDoc
 // ─── Record path (PS-062) ───────────────────────────────────────────────
 
 /// The action class an fx tool name reverse-maps to, if any. Tools with
-/// no passport class produce no grant record.
+/// no passport class produce no grant record. Iterating the enum fields
+/// keeps this aligned with ActionClass automatically — a new class needs
+/// no second table here.
 pub fn actionClassForTool(tool_name: []const u8) ?grants.ActionClass {
-    const tables = .{
-        .{ grants.ActionClass.fs_read, &grants.fx_tool_names.fs_read },
-        .{ grants.ActionClass.fs_write, &grants.fx_tool_names.fs_write },
-        .{ grants.ActionClass.shell_exec, &grants.fx_tool_names.shell_exec },
-        .{ grants.ActionClass.net_fetch, &grants.fx_tool_names.net_fetch },
-        .{ grants.ActionClass.agent_spawn, &grants.fx_tool_names.agent_spawn },
-    };
-    inline for (tables) |table| {
-        for (table[1]) |name| {
-            if (std.mem.eql(u8, tool_name, name)) return table[0];
+    inline for (@typeInfo(grants.ActionClass).@"enum".fields) |field| {
+        const class: grants.ActionClass = @enumFromInt(field.value);
+        for (grants.mappedToolsForClass(class)) |name| {
+            if (std.mem.eql(u8, tool_name, name)) return class;
         }
     }
     return null;
 }
 
 /// Serialize "YYYY-MM-DDTHH:MM:SSZ" for an epoch-millis timestamp.
-/// Negative (pre-1970) input is not representable in EpochSeconds and is
-/// unreachable here: `ms` is a wall-clock timestamp.
+/// Shared with the gateway-timestamp codec in shared/types.zig.
 pub fn formatIso8601Z(alloc: Allocator, ms: i64) ![]u8 {
-    const epoch_secs: std.time.epoch.EpochSeconds = .{
-        .secs = @intCast(@max(0, @divFloor(ms, 1000))),
-    };
-    const year_day = epoch_secs.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_secs = epoch_secs.getDaySeconds();
-    return std.fmt.allocPrint(
-        alloc,
-        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
-        .{
-            @as(u64, year_day.year),
-            @as(u64, month_day.month.numeric()),
-            @as(u64, month_day.day_index + 1),
-            @as(u64, day_secs.getHoursIntoDay()),
-            @as(u64, day_secs.getMinutesIntoHour()),
-            @as(u64, day_secs.getSecondsIntoMinute()),
-        },
-    );
+    return shared_types.formatGatewayTimestampZ(alloc, ms);
 }
 
 /// Record a holder-confirmed fx session grant into the passport. Tools
@@ -300,6 +280,37 @@ pub fn recordToolGrant(
     defer alloc.free(rel);
     try store.writeSurface(alloc, rel, record);
     return id;
+}
+
+/// getenv("HOME") + Store.open + enabled gate: the shared prologue for
+/// grant-recording callers. Returns the owned store when the backend is
+/// live, null when HOME is unset or the backend is disabled; open
+/// failures propagate (a misconfigured enabled state fails closed).
+pub fn openPassportStoreFromEnv(alloc: Allocator) !?store_redirect.Store {
+    const home = io_mod.getenv("HOME") orelse return null;
+    var store = try store_redirect.Store.open(alloc, home);
+    if (!store.passportEnabled()) {
+        store.deinit();
+        return null;
+    }
+    return store;
+}
+
+/// Record a holder-confirmed session grant into the passport (PS-062).
+/// Best-effort outside the authority lock: a record failure must not
+/// stall or fail the local grant, so it logs and returns instead.
+pub fn recordSessionGrantBestEffort(alloc: Allocator, tool_name: []const u8, scope: []const u8) void {
+    var store = (openPassportStoreFromEnv(alloc) catch null) orelse return;
+    defer store.deinit();
+    const id = recordToolGrant(alloc, &store, tool_name, scope, io_mod.milliTimestamp()) catch |err| {
+        debug_trace.logf(
+            "passport",
+            "event=grant_record_failed tool={s} err={s}",
+            .{ tool_name, @errorName(err) },
+        );
+        return;
+    };
+    if (id) |gid| alloc.free(gid);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────

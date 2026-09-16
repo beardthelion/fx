@@ -958,6 +958,19 @@ pub const Store = struct {
             );
             return .indeterminate;
         };
+        // The passport mirror goes first: if the remote delete fails the
+        // local tree is still intact, so the session cannot resurrect a
+        // deleted-local copy on the next hydrate.
+        if (self.canonical_root.passport) |passport_store| {
+            session_sync.deleteSession(alloc, passport_store, loaded.active_id) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event={s} disposition=indeterminate stage=passport_delete err={s}",
+                    .{ event_name, @errorName(err) },
+                );
+                return .indeterminate;
+            };
+        }
         sessions.dir.deleteTree(io_mod.getIo(), loaded.active_id) catch |err| {
             debug_trace.logf(
                 "session",
@@ -974,18 +987,6 @@ pub const Store = struct {
             );
             return .indeterminate;
         };
-        // The passport mirror must go too; a stale remote copy would
-        // resurrect the session on the next hydrate.
-        if (self.canonical_root.passport) |passport_store| {
-            session_sync.deleteSession(alloc, passport_store, loaded.active_id) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event={s} disposition=indeterminate stage=passport_delete err={s}",
-                    .{ event_name, @errorName(err) },
-                );
-                return .indeterminate;
-            };
-        }
         latest_pointer.removeDeferredToken(
             sessions,
             loaded.active_id,
@@ -1026,6 +1027,12 @@ pub const Store = struct {
         target: ResumeTarget,
     ) !?ResumeViewAdmission {
         var root = self.canonical_root;
+        // Hydration on this throwaway root can materialize the sessions
+        // dir; close it on every exit so the fd does not leak.
+        const had_sessions = root.sessions != null;
+        defer if (!had_sessions) {
+            if (root.sessions) |*s| s.close();
+        };
         return switch (target) {
             .id => |id| try root.admitResumeView(alloc, id),
             .last => blk: {
@@ -1837,6 +1844,10 @@ pub const Store = struct {
         return switch (authority) {
             .schema_v3 => {
                 var root = self.canonical_root;
+                const had_sessions = root.sessions != null;
+                defer if (!had_sessions) {
+                    if (root.sessions) |*s| s.close();
+                };
                 var state = root.loadReadOnly(alloc, session_id, options.log) catch |err| {
                     return mapReplayError(err);
                 };
@@ -2479,6 +2490,10 @@ pub const Store = struct {
         cache_lock_held = false;
         for (observed.items) |token| {
             var root = self.canonical_root;
+            const had_sessions = root.sessions != null;
+            defer if (!had_sessions) {
+                if (root.sessions) |*s| s.close();
+            };
             var boundary = root.captureReadBoundary(
                 alloc,
                 token.session_id,
@@ -3110,12 +3125,14 @@ pub const Store = struct {
                 var root = self.canonical_root;
                 if (root.passport == null) return error.SessionNotFound;
                 const materialized = root.sessions == null;
-                if (!try root.hydrateFromPassport(alloc, session_id)) {
-                    return error.SessionNotFound;
-                }
+                // Armed before hydrateFromPassport so a hydrate error
+                // cannot leak the materialized dir either.
                 defer if (materialized) {
                     if (root.sessions) |*s| s.close();
                 };
+                if (!try root.hydrateFromPassport(alloc, session_id)) {
+                    return error.SessionNotFound;
+                }
                 var store = self;
                 store.canonical_root = root;
                 break :blk try store.openSessionDir(session_id);
@@ -3224,6 +3241,10 @@ pub const Store = struct {
         const loaded = switch (authority) {
             .schema_v3 => blk: {
                 var root = self.canonical_root;
+                const had_sessions = root.sessions != null;
+                defer if (!had_sessions) {
+                    if (root.sessions) |*s| s.close();
+                };
                 break :blk root.resumeForWrite(
                     alloc,
                     session_id,
@@ -3342,6 +3363,10 @@ pub const Store = struct {
                 tokenScopeRequiresCanonicalReplay(replay_scope, entry.name))
             {
                 var root = self.canonical_root;
+                const had_sessions = root.sessions != null;
+                defer if (!had_sessions) {
+                    if (root.sessions) |*s| s.close();
+                };
                 var state = root.loadReadOnly(
                     alloc,
                     entry.name,
@@ -3460,6 +3485,10 @@ pub const Store = struct {
                 }
 
                 var root = self.canonical_root;
+                const had_sessions = root.sessions != null;
+                defer if (!had_sessions) {
+                    if (root.sessions) |*s| s.close();
+                };
                 var state = root.loadReadOnly(
                     alloc,
                     session_id,
@@ -3648,6 +3677,10 @@ pub const Store = struct {
 
         if (transition.kind == .session_create) {
             var root = self.canonical_root;
+            const had_sessions = root.sessions != null;
+            defer if (!had_sessions) {
+                if (root.sessions) |*s| s.close();
+            };
             const loaded = try root.resumeForWrite(
                 alloc,
                 session_id,
@@ -3908,12 +3941,22 @@ pub const Store = struct {
             session_id,
             options.session_lock_deadline_ms,
         ) catch |err| switch (err) {
-            error.SessionNotFound => blk: {
+            // SessionStoreUnavailable is the read-only root's miss shape:
+            // the session may exist only in the passport mirror.
+            error.SessionNotFound, error.SessionStoreUnavailable => blk: {
                 var root = self.canonical_root;
+                const had_sessions = root.sessions != null;
+                defer if (!had_sessions) {
+                    if (root.sessions) |*s| s.close();
+                };
                 if (!try root.hydrateFromPassport(alloc, session_id)) {
                     return error.SessionNotFound;
                 }
-                break :blk try self.openWritableSessionDir(
+                // Retry through a copy holding the hydrated root: `self`
+                // keeps its absent sessions dir.
+                var store = self;
+                store.canonical_root = root;
+                break :blk try store.openWritableSessionDir(
                     alloc,
                     session_id,
                     options.session_lock_deadline_ms,
@@ -5010,6 +5053,13 @@ fn initWithHome(alloc: Allocator, home: []const u8, workspace_root: []const u8, 
         error.OutOfMemory,
         error.PrivateStatePermissionsUnsupported,
         error.SessionPathUnsafe,
+        // Passport misconfiguration is its own failure class, not a
+        // layout defect: pass it through so an enabled-but-broken
+        // backend is diagnosed as itself.
+        error.PassportSecretsMissing,
+        error.PassportUrlMissing,
+        error.PassportNamespaceInvalid,
+        error.PassportStateCorrupt,
         => return err,
         else => {
             if (!ensure_layout) return err;

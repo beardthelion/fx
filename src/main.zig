@@ -1750,25 +1750,7 @@ const App = struct {
     /// prompts or commands. Best-effort outside the authority lock: a
     /// record failure must not stall or fail the local grant.
     fn recordPassportGrant(self: *App, tool_name: []const u8, target_path: []const u8) void {
-        const home = io_mod.getenv("HOME") orelse return;
-        var store = passport_store_redirect.Store.open(self.alloc, home) catch return;
-        defer store.deinit();
-        if (!store.passportEnabled()) return;
-        const id = passport_grant_import.recordToolGrant(
-            self.alloc,
-            &store,
-            tool_name,
-            target_path,
-            io_mod.milliTimestamp(),
-        ) catch |err| {
-            debug_trace.logf(
-                "passport",
-                "event=grant_record_failed tool={s} err={s}",
-                .{ tool_name, @errorName(err) },
-            );
-            return;
-        };
-        if (id) |gid| self.alloc.free(gid);
+        passport_grant_import.recordSessionGrantBestEffort(self.alloc, tool_name, target_path);
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
@@ -3008,7 +2990,9 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     // Capture and scrub FX_PASSPORT_* before the environ is installed
     // anywhere: the captured map keeps them readable for fx config while
     // envp, environ blocks, and every child process never see them.
-    passport_config.captureAndScrubRaw(processAllocator(), raw_env);
+    // A capture failure is fatal — secrets we could not keep must not
+    // silently degrade to "backend disabled".
+    try passport_config.captureAndScrubRaw(processAllocator(), raw_env);
 
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {

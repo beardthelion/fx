@@ -589,6 +589,10 @@ pub const Store = struct {
             if (self.passport) |passport_store| {
                 passport_store.writeSurface(alloc, "settings.json", candidate) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    // Stale base: the remote moved under the cycle, so
+                    // re-read and re-merge inside the bounded loop
+                    // instead of committing against a stale read.
+                    error.PassportStaleBase => continue,
                     else => return error.SettingsCommitFailed,
                 };
             } else {
@@ -4068,4 +4072,41 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+const test_server = @import("../passport/test_server.zig");
+
+test "passport-backed mutation retries a stale base and still commits" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"future\":{\"nested\":7}}\n");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var mock = store_redirect.MockBackend{};
+    defer mock.deinit(alloc);
+    // The first writeSurface answers PassportStaleBase; the bounded loop
+    // re-reads the primary and re-merges instead of committing stale.
+    var flaky = test_server.FlakyBackend{
+        .inner = mock.backend(),
+        .stale_writes_left = 1,
+    };
+
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    const backend_store = try alloc.create(store_redirect.Store);
+    backend_store.* = try store_redirect.Store.init(alloc, home, flaky.backend());
+    store.passport = backend_store;
+
+    var outcome = try store.applyUserPatch(alloc, .{ .fast_mode = true });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const remote = mock.entries.get("config/settings.json") orelse
+        return error.TestExpectedRemoteSettings;
+    try std.testing.expect(std.mem.find(u8, remote, "\"fast_mode\":true") != null);
+    try std.testing.expect(std.mem.find(u8, remote, "\"future\":{\"nested\":7}") == null);
 }

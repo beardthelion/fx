@@ -117,33 +117,22 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
 
     // When the passport backend is enabled the memories surface lives in
     // the encrypted store; when it is not, every call below takes the same
-    // local file path as before.
-    var store = store_redirect.Store.open(alloc, home) catch |err| switch (err) {
+    // local file path as before. openEnabled returns null when disabled
+    // and propagates a misconfigured enabled state rather than falling
+    // back to local files.
+    const store: ?*store_redirect.Store = store_redirect.openEnabled(alloc, home) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MemoryStoreUnreadable,
     };
-    defer store.deinit();
+    defer if (store) |ptr| store_redirect.destroyOwned(ptr);
 
     if (std.mem.eql(u8, action, "save")) {
         const fact_value = fact orelse return std.fmt.allocPrint(alloc, "no fact provided", .{});
-        var existing = try loadMemories(alloc, &store, memories_path);
-        defer freeMemories(alloc, &existing);
-
-        for (existing.items) |memory| {
-            if (std.mem.eql(u8, memory, fact_value)) return std.fmt.allocPrint(alloc, "remembered", .{});
-        }
-
-        {
-            const fact_copy = try alloc.dupe(u8, fact_value);
-            errdefer alloc.free(fact_copy);
-            try existing.append(alloc, fact_copy);
-        }
-        try saveMemories(alloc, &store, memories_path, existing.items);
-        return std.fmt.allocPrint(alloc, "remembered", .{});
+        return saveWithRetry(alloc, store, memories_path, fact_value);
     }
 
     if (std.mem.eql(u8, action, "list")) {
-        var existing = try loadMemories(alloc, &store, memories_path);
+        var existing = try loadMemories(alloc, store, memories_path);
         defer freeMemories(alloc, &existing);
 
         if (existing.items.len == 0) return std.fmt.allocPrint(alloc, "No saved memories", .{});
@@ -157,8 +146,8 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     }
 
     if (std.mem.eql(u8, action, "clear")) {
-        if (store.passportEnabled()) {
-            store.deleteSurface(alloc, memories_surface) catch return error.MemoryClearFailed;
+        if (store) |passport| {
+            passport.deleteSurface(alloc, memories_surface) catch return error.MemoryClearFailed;
         } else {
             std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -169,6 +158,54 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     }
 
     return error.UnsupportedMemoryAction;
+}
+
+/// Read->merge->write retries on a stale-base verdict.
+const stale_base_max_attempts: u8 = 3;
+
+/// A stale-base verdict means the remote moved under the
+/// load->merge->write cycle; retry the whole cycle, bounded, so a
+/// concurrent save is not silently dropped.
+fn saveWithRetry(
+    alloc: Allocator,
+    store: ?*store_redirect.Store,
+    memories_path: []const u8,
+    fact_value: []const u8,
+) ![]u8 {
+    var attempt: u8 = 0;
+    while (true) {
+        attempt += 1;
+        return saveMemoriesOnce(alloc, store, memories_path, fact_value) catch |err| switch (err) {
+            error.PassportStaleBase => {
+                if (attempt >= stale_base_max_attempts) return err;
+                continue;
+            },
+            else => |e| return e,
+        };
+    }
+}
+
+/// One load->dedup->append->write pass of the "save" action.
+fn saveMemoriesOnce(
+    alloc: Allocator,
+    store: ?*store_redirect.Store,
+    memories_path: []const u8,
+    fact_value: []const u8,
+) ![]u8 {
+    var existing = try loadMemories(alloc, store, memories_path);
+    defer freeMemories(alloc, &existing);
+
+    for (existing.items) |memory| {
+        if (std.mem.eql(u8, memory, fact_value)) return std.fmt.allocPrint(alloc, "remembered", .{});
+    }
+
+    {
+        const fact_copy = try alloc.dupe(u8, fact_value);
+        errdefer alloc.free(fact_copy);
+        try existing.append(alloc, fact_copy);
+    }
+    try saveMemories(alloc, store, memories_path, existing.items);
+    return std.fmt.allocPrint(alloc, "remembered", .{});
 }
 
 fn isSupportedAction(action: []const u8) bool {
@@ -485,4 +522,35 @@ test "memory owner preserves active output behavior" {
 
     try expectMemoryOutput("{\"action\":\"clear\"}", "memories cleared");
     try expectMemoryOutput("{\"action\":\"list\"}", "No saved memories");
+}
+
+const test_server = @import("../../core/passport/test_server.zig");
+
+test "memory save retries a stale base and still lands the fact" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var mock = store_redirect.MockBackend{};
+    defer mock.deinit(alloc);
+    var flaky = test_server.FlakyBackend{
+        .inner = mock.backend(),
+        .stale_writes_left = 1,
+    };
+    var store = try store_redirect.Store.init(alloc, home, flaky.backend());
+    defer store.deinit();
+
+    const out = try saveWithRetry(alloc, &store, "/unused/memories.json", "likes Zig");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("remembered", out);
+    try std.testing.expectEqual(@as(usize, 2), flaky.write_calls);
+
+    const remote = mock.entries.get("memory/memories.json") orelse
+        return error.TestExpectedRemoteMemories;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, remote, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("likes Zig", parsed.value.array.items[0].string);
 }

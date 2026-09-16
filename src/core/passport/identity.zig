@@ -291,6 +291,21 @@ pub fn namespaceFor(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
     return std.fmt.allocPrint(alloc, "passport:{s}", .{encoded});
 }
 
+/// Inverse of namespaceFor: recover the genesis DID a `passport:` namespace
+/// pins (PS-012). The caller owns the returned slice; null when the
+/// namespace does not decode back to a well-formed did:key identity.
+pub fn didFromNamespace(alloc: Allocator, namespace: []const u8) Allocator.Error!?[]u8 {
+    const prefix = "passport:";
+    if (!std.mem.startsWith(u8, namespace, prefix)) return null;
+    const did = try alloc.dupe(u8, namespace[prefix.len..]);
+    std.mem.replaceScalar(u8, did, '_', ':');
+    if ((try publicKeyFromDid(alloc, did)) == null) {
+        alloc.free(did);
+        return null;
+    }
+    return did;
+}
+
 /// PS-012: encoded namespaces must match this shape before storage access.
 pub fn isValidNamespace(namespace: []const u8) bool {
     const prefix = "passport:did_";

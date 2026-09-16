@@ -542,9 +542,14 @@ fn ensureThreadedIo() void {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
-        // Same custody rule as the CLI entry: capture FX_PASSPORT_* for fx
-        // config, then strip them so spawned children never inherit them.
-        passport_config.captureAndScrubRaw(std.heap.c_allocator, raw_environ);
+        // Same custody rule as the CLI entry, minus the in-place rewrite:
+        // the host process owns its libc environ, so fx captures
+        // FX_PASSPORT_* for config and relies on the clone-time scrub hook
+        // to keep spawned children from inheriting them. A capture failure
+        // is not fatal here: the scrub hook is installed before the
+        // fallible walk, and config resolution falls back to live getenv
+        // because the host environ retains the entries.
+        passport_config.captureRawEnv(std.heap.c_allocator, raw_environ) catch {};
         io_mod.setRawEnviron(raw_environ);
         const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
         defer if (workspace_root) |path| std.heap.c_allocator.free(path);

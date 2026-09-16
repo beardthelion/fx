@@ -307,6 +307,17 @@ pub fn mirrorSession(
         const bytes = (try readBounded(alloc, session_dir, name, cap)) orelse
             try alloc.dupe(u8, "");
         defer alloc.free(bytes);
+        // Scan the assembled file before it is chunked: the per-entry
+        // scan the backend applies inside push sees each 512KiB chunk in
+        // isolation, so a credential straddling a boundary would pass as
+        // two clean halves (PS-110).
+        const scan_key = try std.fmt.allocPrint(
+            alloc,
+            "sessions/{s}/{s}",
+            .{ session_id, name },
+        );
+        defer alloc.free(scan_key);
+        try store.scanSurface(alloc, scan_key, bytes);
         const digest = try identity.sha256Hex(alloc, bytes);
         defer alloc.free(digest);
         const n_chunks = chunksFor(bytes.len);
@@ -479,10 +490,24 @@ pub fn hydrateSession(
         try contents.append(alloc, .{ .name = f.name, .bytes = buf });
     }
 
+    // Cleanup scope: a failed hydrate may only remove a tree it created.
+    // A pre-existing local session dir belongs to a real session and must
+    // survive a bad mirror.
+    const preexisting = blk: {
+        _ = sessions_dir.dir.statFile(io_mod.getIo(), session_id, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
     var dir = try io_mod.openOrCreateVerifiedPrivateDir(sessions_dir, session_id);
     errdefer {
         dir.close();
-        sessions_dir.dir.deleteTree(io_mod.getIo(), session_id) catch {};
+        if (!preexisting) {
+            sessions_dir.dir.deleteTree(io_mod.getIo(), session_id) catch {};
+        }
     }
     for (contents.items) |c| {
         try io_mod.durableReplaceVerified(alloc, &dir, c.name, c.bytes);

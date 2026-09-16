@@ -1257,20 +1257,7 @@ fn buildSlashCommandsJson(alloc: Allocator) ![]u8 {
 }
 
 fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
-    const epoch_secs: u64 = @intCast(@divTrunc(timestamp_ms, 1000));
-    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
-    const day = epoch.getDaySeconds();
-    const year_day = epoch.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        year_day.year,
-        @intFromEnum(month_day.month),
-        month_day.day_index + 1,
-        day.getHoursIntoDay(),
-        day.getMinutesIntoHour(),
-        day.getSecondsIntoMinute(),
-    });
+    return types.formatGatewayTimestampZ(alloc, timestamp_ms);
 }
 
 pub fn writeModelConfigOption(

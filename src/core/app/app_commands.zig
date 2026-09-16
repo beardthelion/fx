@@ -976,7 +976,7 @@ pub fn Handlers(comptime App: type) type {
                 );
                 return;
             };
-            var store = passport_store_redirect.Store.open(app.alloc, home) catch |err| {
+            const owned = passport_store_redirect.openEnabled(app.alloc, home) catch |err| {
                 const body = try std.fmt.allocPrint(
                     app.alloc,
                     "passport backend unavailable: {s}",
@@ -986,20 +986,20 @@ pub fn Handlers(comptime App: type) type {
                 try writePermissionManagementNotice(app, .@"error", body);
                 return;
             };
-            defer store.deinit();
-            if (!store.passportEnabled()) {
+            defer if (owned) |ptr| passport_store_redirect.destroyOwned(ptr);
+            const store = owned orelse {
                 try writePermissionManagementNotice(
                     app,
                     .neutral,
                     "passport backend is not enabled; nothing to review",
                 );
                 return;
-            }
+            };
 
             const verb = splitPermissionWord(rest);
             const now_ms = io_mod.milliTimestamp();
             if (verb == null or std.ascii.eqlIgnoreCase(verb.?.word, "list")) {
-                try listPassportGrants(app, &store, home, now_ms);
+                try listPassportGrants(app, store, home, now_ms);
                 return;
             }
 
@@ -1026,7 +1026,7 @@ pub fn Handlers(comptime App: type) type {
             // mutex: listing grants may block on the passport backend.
             const pending = passport_grant_import.listPending(
                 app.alloc,
-                &store,
+                store,
                 home,
                 now_ms,
             ) catch |err| {

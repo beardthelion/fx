@@ -25,9 +25,11 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const client_mod = @import("client.zig");
 const config_mod = @import("config.zig");
 const identity = @import("identity.zig");
+const secretscan = @import("secretscan.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -127,6 +129,18 @@ pub const Backend = struct {
             alloc: Allocator,
             keys: []const []const u8,
         ) BackendError!void = null,
+        /// Optional pre-upload scan of assembled plaintext under `key`
+        /// (the real file or surface name). Backends that chunk content
+        /// before pushing need this: the per-entry scan inside push sees
+        /// each chunk in isolation, so a credential straddling a chunk
+        /// boundary would evade it (PS-110). Null means no assembled
+        /// scan; callers may skip the call entirely when local.
+        scan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            key: []const u8,
+            bytes: []const u8,
+        ) BackendError!void = null,
     };
 
     pub fn read(self: Backend, alloc: Allocator, key: []const u8) BackendError!?[]u8 {
@@ -169,6 +183,11 @@ pub const Backend = struct {
     pub fn deleteBatch(self: Backend, alloc: Allocator, keys: []const []const u8) BackendError!void {
         if (self.vtable.delete_batch) |db| return db(self.ptr, alloc, keys);
         for (keys) |key| try self.vtable.delete(self.ptr, alloc, key);
+    }
+    /// Scan assembled plaintext the way the backend would before upload.
+    /// A null vtable entry means the backend performs no assembled scan.
+    pub fn scan(self: Backend, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
+        if (self.vtable.scan) |s| return s(self.ptr, alloc, key, bytes);
     }
 };
 
@@ -250,15 +269,20 @@ pub const PassportBackend = struct {
         .read_batch = readBatchImpl,
         .write_batch = writeBatchImpl,
         .delete_batch = deleteBatchImpl,
+        .scan = scanImpl,
     };
 
     fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!?[]u8 {
         const self: *PassportBackend = @ptrCast(@alignCast(ptr));
-        _ = alloc;
-        return self.client.readEntry(key) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
+        const bytes = self.client.readEntry(key) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
         };
+        const remote = bytes orelse return null;
+        // readEntry allocates on the client's allocator; the contract is
+        // caller-allocator-owned memory.
+        defer self.client.alloc.free(remote);
+        return try alloc.dupe(u8, remote);
     }
 
     /// One manifest fetch+verify covers the whole batch (PS-041).
@@ -267,24 +291,105 @@ pub const PassportBackend = struct {
         return self.client.readEntries(alloc, keys);
     }
 
+    /// A stale-base (409) verdict only means the remote manifest moved
+    /// mid-commit: the push re-fetches and retries, bounded so a
+    /// contested namespace cannot spin the caller forever.
+    const stale_base_max_attempts: u8 = 4;
+
+    fn pushWithRetry(
+        self: *PassportBackend,
+        entries: []const client_mod.Entry,
+        deletions: []const []const u8,
+    ) client_mod.Error!client_mod.PushResult {
+        var attempt: u8 = 1;
+        while (true) {
+            return self.client.push(entries, deletions) catch |err| switch (err) {
+                error.PassportStaleBase => {
+                    if (attempt >= stale_base_max_attempts)
+                        return error.PassportStaleBase;
+                    debug_trace.logf(
+                        "passport",
+                        "event=stale_base_retry attempt={d}",
+                        .{attempt},
+                    );
+                    attempt += 1;
+                    continue;
+                },
+                else => |e| return e,
+            };
+        }
+    }
+
     fn writeImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
         const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        _ = alloc;
         const entries = [_]client_mod.Entry{.{ .key = key, .plaintext = bytes }};
-        var result = self.client.push(&entries, &.{}) catch |err| switch (err) {
+        var result = self.pushWithRetry(&entries, &.{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
         };
-        defer result.deinit(alloc);
+        // push allocates on the client's allocator.
+        defer result.deinit(self.client.alloc);
+        self.traceWarnFindings();
     }
 
     fn deleteImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!void {
         const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        _ = alloc;
         const deletions = [_][]const u8{key};
-        var result = self.client.push(&.{}, &deletions) catch |err| switch (err) {
+        var result = self.pushWithRetry(&.{}, &deletions) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
         };
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.alloc);
+    }
+
+    /// Assembled-file scan for chunked uploaders (session mirroring):
+    /// enforces the client's scan mode on the whole plaintext under the
+    /// real file name, before the caller splits it into chunk entries
+    /// that would each scan clean around a boundary-straddling secret.
+    fn scanImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8, bytes: []const u8) BackendError!void {
+        const self: *PassportBackend = @ptrCast(@alignCast(ptr));
+        if (self.client.scan_mode == .off) return;
+        const entries = [_]secretscan.Entry{.{ .key = key, .text = bytes }};
+        var findings: std.ArrayList(secretscan.Finding) = .empty;
+        defer {
+            for (findings.items) |*f| f.deinit(alloc);
+            findings.deinit(alloc);
+        }
+        const blocked = if (secretscan.enforce(
+            alloc,
+            &entries,
+            self.client.scan_mode,
+            &findings,
+        )) |_|
+            false
+        else |err| switch (err) {
+            error.SecretFound => true,
+            else => |e| return e,
+        };
+        for (findings.items) |f| {
+            debug_trace.logf(
+                "passport",
+                "event=secret_scan_{s} key={s} rule={s} line={d} match={s}",
+                .{ if (blocked) "block" else "warn", f.entry_key, f.rule, f.line, f.match },
+            );
+        }
+        if (blocked) return error.SecretFound;
+    }
+
+    /// Warn-mode secret scan reports into debug_trace so a committed
+    /// credential shape is visible without blocking the write (PS-110).
+    fn traceWarnFindings(self: *PassportBackend) void {
+        if (self.client.scan_mode != .warn) return;
+        const findings = self.client.scanFindings() orelse return;
+        for (findings) |f| {
+            debug_trace.logf(
+                "passport",
+                "event=secret_scan_warn key={s} rule={s} line={d} match={s}",
+                .{ f.entry_key, f.rule, f.line, f.match },
+            );
+        }
     }
 
     fn listImpl(ptr: *anyopaque, alloc: Allocator, prefix: []const u8) BackendError![][]u8 {
@@ -294,11 +399,12 @@ pub const PassportBackend = struct {
             else => |e| return e,
         };
         defer {
+            // hashes() allocates on the client's allocator.
             for (entries) |e| {
-                alloc.free(@constCast(e.key));
-                alloc.free(@constCast(e.plaintext));
+                self.client.alloc.free(@constCast(e.key));
+                self.client.alloc.free(@constCast(e.plaintext));
             }
-            alloc.free(entries);
+            self.client.alloc.free(entries);
         }
         var out: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -327,20 +433,22 @@ pub const PassportBackend = struct {
         for (keys, plaintexts, 0..) |key, bytes, i| {
             entries[i] = .{ .key = key, .plaintext = bytes };
         }
-        var result = self.client.push(entries, &.{}) catch |err| switch (err) {
+        var result = self.pushWithRetry(entries, &.{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
         };
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.alloc);
+        self.traceWarnFindings();
     }
 
     fn deleteBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError!void {
         const self: *PassportBackend = @ptrCast(@alignCast(ptr));
-        var result = self.client.push(&.{}, keys) catch |err| switch (err) {
+        _ = alloc;
+        var result = self.pushWithRetry(&.{}, keys) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| return e,
         };
-        defer result.deinit(alloc);
+        defer result.deinit(self.client.alloc);
     }
 };
 
@@ -361,6 +469,12 @@ pub const Store = struct {
     /// Kept alive for the Store's lifetime: client.did/genesis_did borrow
     /// the identity's DID allocation.
     identity: ?identity.Identity = null,
+    /// Namespace-derived genesis DID (post-rotation holder, PS-012). Kept
+    /// alive because client.genesis_did borrows the slice.
+    genesis_did: ?[]u8 = null,
+    /// Verified rotation chain loaded at open. Kept alive because
+    /// client.attestations borrows the slice.
+    rotation_chain: []identity.RotationAttestation = &.{},
     passport_backend: ?PassportBackend = null,
     injected_backend: ?Backend = null,
 
@@ -381,11 +495,31 @@ pub const Store = struct {
             var id = try identity.identityFromSeed(alloc, seed);
             errdefer id.deinit(alloc);
 
+            var genesis_did: []const u8 = id.did;
             if (cfg.namespace) |ns| {
-                // An explicit namespace pins a genesis DID that differs
-                // from the signing key's own DID (post-rotation holder).
-                // It must still be a valid encoded namespace (PS-012).
+                // An explicit namespace pins the genesis DID it was
+                // derived from — post-rotation the holder key and the
+                // namespace owner differ, so decoding the namespace is
+                // the only honest way to recover the chain anchor.
                 if (!identity.isValidNamespace(ns)) return error.PassportNamespaceInvalid;
+                store.genesis_did = (try identity.didFromNamespace(alloc, ns)) orelse
+                    return error.PassportNamespaceInvalid;
+                genesis_did = store.genesis_did.?;
+            }
+
+            // Restore the persisted anti-rollback cursor so a restarted
+            // client still enforces the seq floor (PS-041).
+            const state_path = try std.fs.path.join(
+                alloc,
+                &.{ home, profile_paths.root_dir_name, "passport", "manifest-state.json" },
+            );
+            defer alloc.free(state_path);
+            var state_seq: u64 = 0;
+            var state_hash: ?[]u8 = null;
+            defer if (state_hash) |h| alloc.free(h);
+            if (try loadManifestState(alloc, state_path)) |state| {
+                state_seq = state.seq;
+                state_hash = state.canonical_sha256;
             }
 
             store.http = try alloc.create(client_mod.HttpTransport);
@@ -401,16 +535,45 @@ pub const Store = struct {
                     .url = cfg.url,
                     .key_pair = id.key_pair,
                     .did = id.did,
-                    .genesis_did = id.did,
+                    .genesis_did = genesis_did,
                     // The override rides into init so the entry key is
                     // derived once, against the effective namespace.
                     .namespace = cfg.namespace,
                     .passphrase = passphrase,
                     .scan_mode = cfg.scan_mode,
+                    .last_seq = state_seq,
+                    .last_manifest_hash = state_hash,
+                    .manifest_state_path = state_path,
                 },
             );
             errdefer store.client.?.deinit();
             store.identity = id;
+
+            if (cfg.namespace != null) {
+                // A pinned namespace may point at a passport whose holder
+                // rotated keys: rebuild and verify the chain, then adopt
+                // it for auth and manifest signer checks (PS-051/052).
+                store.rotation_chain = try store.client.?.loadRotationChain(alloc);
+                errdefer {
+                    for (store.rotation_chain) |*att| {
+                        alloc.free(@constCast(att.genesis_did));
+                        alloc.free(@constCast(att.new_did));
+                        alloc.free(@constCast(att.prev_hash));
+                        alloc.free(@constCast(att.sig));
+                    }
+                    alloc.free(store.rotation_chain);
+                }
+                const current_did: []const u8 = if (store.rotation_chain.len > 0)
+                    store.rotation_chain[store.rotation_chain.len - 1].new_did
+                else
+                    genesis_did;
+                // A namespace we cannot act on (our key is neither the
+                // genesis nor the current successor) is a misconfigured
+                // enabled state: fail closed, not local fallback.
+                if (!std.mem.eql(u8, current_did, id.did))
+                    return error.PassportNamespaceInvalid;
+                store.client.?.attestations = store.rotation_chain;
+            }
 
             store.passport_backend = .{ .client = store.client.? };
         }
@@ -437,6 +600,14 @@ pub const Store = struct {
         }
         if (self.cfg) |*cfg| cfg.deinit(self.alloc);
         if (self.identity) |*id| id.deinit(self.alloc);
+        if (self.genesis_did) |did| self.alloc.free(did);
+        for (self.rotation_chain) |*att| {
+            self.alloc.free(@constCast(att.genesis_did));
+            self.alloc.free(@constCast(att.new_did));
+            self.alloc.free(@constCast(att.prev_hash));
+            self.alloc.free(@constCast(att.sig));
+        }
+        if (self.rotation_chain.len > 0) self.alloc.free(self.rotation_chain);
         self.alloc.free(self.home);
         self.* = undefined;
     }
@@ -649,6 +820,19 @@ pub const Store = struct {
         }
     }
 
+    /// Scan assembled plaintext under `key` (a real file or surface
+    /// name) the way the backend would before upload. Local mode scans
+    /// nothing: the bytes never leave the filesystem.
+    pub fn scanSurface(
+        self: *Store,
+        alloc: Allocator,
+        key: []const u8,
+        bytes: []const u8,
+    ) BackendError!void {
+        const b = self.activeBackend() orelse return;
+        return b.scan(alloc, key, bytes);
+    }
+
     /// List entry keys (passport) or profile-relative paths (local) under
     /// a surface prefix such as "sessions" or "sessions/<id>".
     pub fn listSurface(self: *Store, alloc: Allocator, rel_prefix: []const u8) BackendError![][]u8 {
@@ -711,6 +895,45 @@ pub fn destroyOwned(store: *Store) void {
     const alloc = store.alloc;
     store.deinit();
     alloc.destroy(store);
+}
+
+/// The persisted anti-rollback cursor for a passport namespace (PS-041).
+const ManifestState = struct {
+    seq: u64,
+    /// sha256 hex of the last verified canonical manifest. Owned slice.
+    canonical_sha256: []u8,
+};
+
+/// Load {seq, canonical_sha256} written by Client.persistManifestState.
+/// Null when no cursor exists yet; a malformed file is fail-closed
+/// (PassportStateCorrupt) rather than a silently reset seq floor.
+fn loadManifestState(alloc: Allocator, path: []const u8) !?ManifestState {
+    const bytes = blk: {
+        var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return error.PassportStateCorrupt,
+        };
+        defer file.close(io_mod.getIo());
+        break :blk io_mod.readFileToEnd(alloc, &file, 64 * 1024) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PassportStateCorrupt,
+        };
+    };
+    defer alloc.free(bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch
+        return error.PassportStateCorrupt;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.PassportStateCorrupt;
+    const obj = parsed.value.object;
+    const seq_v = obj.get("seq") orelse return error.PassportStateCorrupt;
+    const hash_v = obj.get("canonical_sha256") orelse return error.PassportStateCorrupt;
+    if (seq_v != .integer or seq_v.integer < 0) return error.PassportStateCorrupt;
+    if (hash_v != .string or hash_v.string.len != 64) return error.PassportStateCorrupt;
+    return .{
+        .seq = @intCast(seq_v.integer),
+        .canonical_sha256 = try alloc.dupe(u8, hash_v.string),
+    };
 }
 
 /// Derive the home dir from a ~/.fx path ("<home>/.fx[/...]"). Returns
@@ -977,4 +1200,80 @@ test "enabled store routes passport surfaces through the backend only" {
     }
     try std.testing.expectEqual(@as(usize, 1), session_keys.len);
     try std.testing.expectEqualStrings("sessions/s1/000001", session_keys[0]);
+}
+
+// ─── Wire-level tests through the scripted server ───────────────────────
+
+const test_server = @import("test_server.zig");
+
+fn wireClient(
+    alloc: Allocator,
+    server: *test_server.Server,
+    id: *const identity.Identity,
+) !client_mod.Client {
+    return client_mod.Client.init(alloc, server.transport(), .{
+        .url = "http://passport.test",
+        .key_pair = id.key_pair,
+        .did = id.did,
+        .passphrase = "wire-test-passphrase",
+    });
+}
+
+test "passport backend retries a stale base and still commits" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(alloc, &tmp);
+    defer alloc.free(home);
+
+    var server = test_server.Server.init(alloc);
+    defer server.deinit();
+    server.namespace_missing = true;
+    server.stale_puts_left = 2;
+
+    var id = try identity.identityFromSeed(alloc, [_]u8{9} ** 32);
+    defer id.deinit(alloc);
+    var client = try wireClient(alloc, &server, &id);
+    defer client.deinit();
+
+    var pb = PassportBackend{ .client = &client };
+    var store = try Store.init(alloc, home, pb.backend());
+    defer store.deinit();
+
+    try store.writeSurface(alloc, "memories.json", "[\"m1\"]\n");
+
+    // Two stale verdicts, then the retried push committed the delta and
+    // the signed manifest.
+    try std.testing.expect(server.puts >= 3);
+    try std.testing.expect(server.entries.get("memory/memories.json") != null);
+    try std.testing.expect(server.entries.get(client_mod.manifest_entry_key) != null);
+}
+
+test "passport backend exhausts bounded stale-base retries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(alloc, &tmp);
+    defer alloc.free(home);
+
+    var server = test_server.Server.init(alloc);
+    defer server.deinit();
+    server.namespace_missing = true;
+    // One 409 past the retry budget.
+    server.stale_puts_left = PassportBackend.stale_base_max_attempts;
+
+    var id = try identity.identityFromSeed(alloc, [_]u8{9} ** 32);
+    defer id.deinit(alloc);
+    var client = try wireClient(alloc, &server, &id);
+    defer client.deinit();
+
+    var pb = PassportBackend{ .client = &client };
+    var store = try Store.init(alloc, home, pb.backend());
+    defer store.deinit();
+
+    try std.testing.expectError(
+        error.PassportStaleBase,
+        store.writeSurface(alloc, "memories.json", "[\"m1\"]\n"),
+    );
+    try std.testing.expect(server.entries.get("memory/memories.json") == null);
 }

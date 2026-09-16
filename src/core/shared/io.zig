@@ -424,11 +424,13 @@ pub fn cloneEnvironMap(
         while (raw[len] != null) : (len += 1) {}
         const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
         map = std.process.Environ.Map.init(alloc);
-        errdefer map.deinit();
         try map.putPosixBlock(.{ .slice = entries });
     } else {
         return error.EnvironmentUnavailable;
     }
+    // One cleanup scope covers every source form: a failure while
+    // collecting scrub keys must not leak the cloned map.
+    errdefer map.deinit();
     if (environ_scrub_hook) |hook| {
         var keys: std.ArrayList([]const u8) = .empty;
         defer keys.deinit(alloc);

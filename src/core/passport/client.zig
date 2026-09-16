@@ -91,7 +91,8 @@ pub const HttpTransport = struct {
     /// mirror runs on the write path), so every request races a deadline.
     /// When the deadline wins the request task is cancelled; cancellation
     /// reaches it at the next Io cancellation point. Io backends without
-    /// task concurrency run the request unbounded instead of failing it.
+    /// task concurrency fail fast: an unbounded request against a hostile
+    /// store is never allowed to run.
     fn requestImpl(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
         const zio = io_mod.getIo();
@@ -126,13 +127,13 @@ pub const HttpTransport = struct {
         var buffer: [2]Event = undefined;
         var select: std.Io.Select(Event) = .init(zio, &buffer);
         select.concurrent(.deadline, Ops.waitDeadline, .{deadline}) catch {
-            // No task concurrency on this backend: preserve the previous
-            // unbounded behavior rather than failing every request.
-            return self.requestInner(alloc, req);
+            // No task concurrency on this backend: fail fast rather than
+            // let a hostile store hold the request open without a bound.
+            return error.PassportHttpFailed;
         };
         select.concurrent(.response, Ops.runRequest, .{ self, alloc, req }) catch {
             Ops.drain(alloc, &select);
-            return self.requestInner(alloc, req);
+            return error.PassportHttpFailed;
         };
         const event = select.await() catch {
             Ops.drain(alloc, &select);
@@ -222,6 +223,12 @@ pub const Error = error{
     PassportProtocol,
     /// The store reports a stale `base` (409): nothing committed.
     PassportStaleBase,
+    /// The persisted anti-rollback cursor could not be parsed (PS-041).
+    /// Fail closed: an unreadable cursor must not reset the seq floor.
+    PassportStateCorrupt,
+    /// The anti-rollback cursor could not be persisted after a verified
+    /// manifest adoption.
+    PassportStatePersistFailed,
     /// A pushed entry carried a credential-shaped secret (PS-110).
     SecretFound,
     /// An entry key violated PS-020/021.
@@ -391,12 +398,15 @@ const VerifiedManifest = struct {
     canonical: []u8,
     /// Decrypted manifest entry plaintext.
     plaintext: []u8,
+    /// DID that signed the blob, verified cryptographically.
+    signer_did: []u8,
     /// entryKey -> sha256 hash, as named by the verified manifest.
     entries: std.json.ObjectMap,
 
     fn deinit(self: *VerifiedManifest, alloc: Allocator) void {
         alloc.free(self.canonical);
         alloc.free(self.plaintext);
+        alloc.free(self.signer_did);
         // entries' strings live in `plaintext`'s parse arena — we deep-duped
         // them into the map keys/values? No: see verifyManifestBlob, which
         // dupes each string with alloc.
@@ -434,7 +444,12 @@ pub const Client = struct {
     encoded_namespace: []u8,
     token: ?Token = null,
     last_seq: u64,
-    last_manifest_canonical: ?[]u8 = null,
+    /// sha256 hex of the last verified canonical manifest (PS-041). The
+    /// hash is what persists across restarts, so the same-seq check
+    /// compares hashes rather than retaining canonical bytes.
+    last_manifest_hash: ?[]u8 = null,
+    /// Where the anti-rollback cursor persists, when enabled.
+    manifest_state_path: ?[]u8 = null,
     last_error: ErrorDetail = .{},
     /// Scan findings from the most recent push (warn mode, or a blocked
     /// push that reported SecretFound). Owned by the client.
@@ -462,6 +477,14 @@ pub const Client = struct {
         scan_mode: secretscan.ScanMode = .block,
         /// Last verified manifest seq (PS-041 anti-rollback).
         last_seq: u64 = 0,
+        /// sha256 hex of the last verified canonical manifest, restored
+        /// from persisted state so a restarted client still detects a
+        /// same-seq manifest swap (PS-041).
+        last_manifest_hash: ?[]const u8 = null,
+        /// Where the anti-rollback cursor persists ({seq, canonical
+        /// manifest hash}), e.g. ~/.fx/passport/manifest-state.json.
+        /// Null disables persistence (tests, in-memory clients).
+        manifest_state_path: ?[]const u8 = null,
     };
 
     pub fn init(alloc: Allocator, transport: Transport, opts: Options) !Client {
@@ -474,6 +497,16 @@ pub const Client = struct {
         const enc_key = try crypto.deriveKey(alloc, opts.passphrase, namespace);
         const encoded_namespace = try urlEncodeSegment(alloc, namespace);
         errdefer alloc.free(encoded_namespace);
+        const last_manifest_hash: ?[]u8 = if (opts.last_manifest_hash) |hash|
+            try alloc.dupe(u8, hash)
+        else
+            null;
+        errdefer if (last_manifest_hash) |hash| alloc.free(hash);
+        const manifest_state_path: ?[]u8 = if (opts.manifest_state_path) |path|
+            try alloc.dupe(u8, path)
+        else
+            null;
+        errdefer if (manifest_state_path) |path| alloc.free(path);
         var url = opts.url;
         if (url.len > 0 and url[url.len - 1] == '/') url = url[0 .. url.len - 1];
         return .{
@@ -489,12 +522,15 @@ pub const Client = struct {
             .namespace = namespace,
             .encoded_namespace = encoded_namespace,
             .last_seq = opts.last_seq,
+            .last_manifest_hash = last_manifest_hash,
+            .manifest_state_path = manifest_state_path,
         };
     }
 
     pub fn deinit(self: *Client) void {
         if (self.token) |*t| t.deinit(self.alloc);
-        if (self.last_manifest_canonical) |c| self.alloc.free(c);
+        if (self.last_manifest_hash) |h| self.alloc.free(h);
+        if (self.manifest_state_path) |p| self.alloc.free(p);
         self.last_error.deinit(self.alloc);
         if (self.last_scan_findings) |f| secretscan.freeFindings(self.alloc, f);
         self.alloc.free(self.namespace);
@@ -504,6 +540,13 @@ pub const Client = struct {
 
     pub fn manifestSeq(self: *const Client) u64 {
         return self.last_seq;
+    }
+
+    /// Scan findings left by the most recent push (warn mode, or a
+    /// blocked push that reported SecretFound). Borrowed; invalidated by
+    /// the next push or deinit.
+    pub fn scanFindings(self: *const Client) ?[]const secretscan.Finding {
+        return self.last_scan_findings;
     }
 
     // ─── Wire helpers ───────────────────────────────────────────────────
@@ -588,7 +631,11 @@ pub const Client = struct {
         };
         defer alloc.free(nonce);
 
-        const sig = try identity.signMessage(alloc, &self.key_pair, nonce);
+        // The signed preimage is domain-separated so a nonce can never be
+        // replayed as some other document's signature (PS-090).
+        const preimage = try std.fmt.allocPrint(alloc, "passport-auth:{s}", .{nonce});
+        defer alloc.free(preimage);
+        const sig = try identity.signMessage(alloc, &self.key_pair, preimage);
         defer alloc.free(sig);
 
         var body_map: std.json.ObjectMap = .empty;
@@ -771,10 +818,15 @@ pub const Client = struct {
 
     // ─── Integrity manifest (PS-040/041) ────────────────────────────────
 
-    /// The DIDs allowed to have signed an integrity manifest: genesis plus
-    /// every successor named by the presented rotation chain.
+    /// The DIDs allowed to have signed an integrity manifest: genesis, the
+    /// active key, and every successor named by the rotation chain.
+    /// The active key is always legal: its signature is still verified
+    /// against the claimed DID's public key, so naming ourselves cannot be
+    /// spoofed, and a post-rotation holder needs it to bootstrap the
+    /// chain load before attestations are populated.
     fn isAuthorizedDid(self: *const Client, did: []const u8) bool {
         if (std.mem.eql(u8, did, self.genesis_did)) return true;
+        if (std.mem.eql(u8, did, self.did)) return true;
         for (self.attestations) |att| {
             if (std.mem.eql(u8, att.new_did, did)) return true;
         }
@@ -783,8 +835,11 @@ pub const Client = struct {
 
     /// Decrypt, parse, and verify a signed manifest blob. Fail closed on
     /// every defect: bad signature, wrong signer, wrong genesis, or a seq
-    /// that went backwards.
-    fn verifyManifestBlob(self: *Client, blob: []const u8) Error!VerifiedManifest {
+    /// that went backwards. `enforce_signer` checks the claimed DID
+    /// against the authorized set; the rotation-chain bootstrap defers it
+    /// (the signature is still verified) because the authorized set is
+    /// what the chain itself establishes.
+    fn verifyManifestBlob(self: *Client, blob: []const u8, enforce_signer: bool) Error!VerifiedManifest {
         const alloc = self.alloc;
         const plaintext = crypto.decryptEntry(alloc, &self.enc_key, manifest_entry_key, blob) catch
             return error.PassportDecrypt;
@@ -809,7 +864,7 @@ pub const Client = struct {
 
         if (!std.mem.eql(u8, genesis_v.string, self.genesis_did))
             return error.PassportIntegrity;
-        if (!self.isAuthorizedDid(did_v.string))
+        if (enforce_signer and !self.isAuthorizedDid(did_v.string))
             return error.PassportIntegrity;
 
         const canonical = try identity.canonicalJson(alloc, manifest_v);
@@ -819,11 +874,15 @@ pub const Client = struct {
 
         const seq: u64 = @intCast(seq_v.integer);
         if (seq < self.last_seq) return error.PassportIntegrity;
-        if (seq == self.last_seq and self.last_manifest_canonical != null and
-            !std.mem.eql(u8, canonical, self.last_manifest_canonical.?))
-        {
-            return error.PassportIntegrity;
+        if (seq == self.last_seq and self.last_manifest_hash != null) {
+            const incoming = try identity.sha256Hex(alloc, canonical);
+            defer alloc.free(incoming);
+            if (!std.mem.eql(u8, incoming, self.last_manifest_hash.?))
+                return error.PassportIntegrity;
         }
+
+        const signer_did = try alloc.dupe(u8, did_v.string);
+        errdefer alloc.free(signer_did);
 
         var entries: std.json.ObjectMap = .empty;
         errdefer freeHashMap(alloc, &entries);
@@ -841,6 +900,7 @@ pub const Client = struct {
             .seq = seq,
             .canonical = canonical,
             .plaintext = plaintext,
+            .signer_did = signer_did,
             .entries = entries,
         };
     }
@@ -877,6 +937,12 @@ pub const Client = struct {
 
     /// Fetch + verify the remote manifest. Null when the passport is empty.
     fn remoteManifest(self: *Client) Error!?VerifiedManifest {
+        return self.remoteManifestMode(.enforce_signer);
+    }
+
+    const SignerMode = enum { enforce_signer, defer_signer };
+
+    fn remoteManifestMode(self: *Client, mode: SignerMode) Error!?VerifiedManifest {
         const view = try self.integrityView();
         switch (view) {
             .no_namespace => return null,
@@ -887,15 +953,241 @@ pub const Client = struct {
             },
             .ok => |blob| {
                 defer self.alloc.free(blob);
-                return try self.verifyManifestBlob(blob);
+                return try self.verifyManifestBlob(blob, mode == .enforce_signer);
             },
         }
     }
 
-    fn adoptManifest(self: *Client, verified: VerifiedManifest) void {
+    /// The remote manifest was cryptographically verified; adopt its seq
+    /// and canonical hash as the local anti-rollback state and persist
+    /// the cursor (PS-041). The write happens before the in-memory swap
+    /// so a failed persist leaves the previous seq/hash fully intact and
+    /// a mid-adoption error cannot blank the same-seq check.
+    fn adoptManifest(self: *Client, verified: VerifiedManifest) Error!void {
+        const alloc = self.alloc;
+        const hash = try identity.sha256Hex(alloc, verified.canonical);
+        errdefer alloc.free(hash);
+        try self.persistManifestState(verified.seq, hash);
         self.last_seq = verified.seq;
-        if (self.last_manifest_canonical) |old| self.alloc.free(old);
-        self.last_manifest_canonical = self.alloc.dupe(u8, verified.canonical) catch null;
+        if (self.last_manifest_hash) |old| alloc.free(old);
+        self.last_manifest_hash = hash;
+    }
+
+    /// Local counterpart of adoptManifest: adopt a manifest this client
+    /// just signed and committed.
+    fn adoptLocalManifest(self: *Client, seq: u64, canonical: []const u8) Error!void {
+        const alloc = self.alloc;
+        const hash = try identity.sha256Hex(alloc, canonical);
+        errdefer alloc.free(hash);
+        try self.persistManifestState(seq, hash);
+        self.last_seq = seq;
+        if (self.last_manifest_hash) |old| alloc.free(old);
+        self.last_manifest_hash = hash;
+    }
+
+    /// A PUT `{base, entries, deletions?}` verdict: keys the store refused
+    /// and deletions it confirmed. Slices are owned by the result.
+    const CommitDeltaResult = struct {
+        skipped: std.ArrayList([]u8) = .empty,
+        deleted: std.ArrayList([]u8) = .empty,
+
+        fn deinit(self: *CommitDeltaResult, alloc: Allocator) void {
+            for (self.skipped.items) |s| alloc.free(s);
+            self.skipped.deinit(alloc);
+            for (self.deleted.items) |s| alloc.free(s);
+            self.deleted.deinit(alloc);
+        }
+
+        fn containsSkipped(self: *const CommitDeltaResult, key: []const u8) bool {
+            for (self.skipped.items) |s| {
+                if (std.mem.eql(u8, s, key)) return true;
+            }
+            return false;
+        }
+    };
+
+    /// PUT `{base, entries, deletions?}` against the namespace and return
+    /// the server's verdict. `base_map` is the hash map the client
+    /// believes the server currently holds; null means the namespace is
+    /// expected to be empty.
+    fn commitDelta(
+        self: *Client,
+        alloc: Allocator,
+        base_map: ?*const std.json.ObjectMap,
+        to_upload: *const std.json.ObjectMap,
+        deletions: []const []const u8,
+    ) Error!CommitDeltaResult {
+        var body_map: std.json.ObjectMap = .empty;
+        defer body_map.deinit(alloc);
+        var base_str: ?[]u8 = null;
+        defer if (base_str) |s| alloc.free(s);
+        if (base_map) |map| {
+            var hash_entries: std.ArrayList(Entry) = .empty;
+            defer hash_entries.deinit(alloc);
+            var hit = map.iterator();
+            while (hit.next()) |kv| {
+                try hash_entries.append(alloc, .{
+                    .key = kv.key_ptr.*,
+                    .plaintext = kv.value_ptr.string,
+                });
+            }
+            base_str = try manifestHash(alloc, hash_entries.items);
+            try body_map.put(alloc, "base", .{ .string = base_str.? });
+        } else {
+            try body_map.put(alloc, "base", .null);
+        }
+        var entries_arr: std.json.ObjectMap = .empty;
+        defer entries_arr.deinit(alloc);
+        var uit = to_upload.iterator();
+        while (uit.next()) |kv| {
+            try entries_arr.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
+        }
+        try body_map.put(alloc, "entries", .{ .object = entries_arr });
+        var del_arr: std.json.Array = .init(alloc);
+        defer del_arr.deinit();
+        if (deletions.len > 0) {
+            for (deletions) |key| try del_arr.append(.{ .string = key });
+            try body_map.put(alloc, "deletions", .{ .array = del_arr });
+        }
+
+        var body_out: std.Io.Writer.Allocating = .init(alloc);
+        defer body_out.deinit();
+        std.json.Stringify.value(
+            @as(std.json.Value, .{ .object = body_map }),
+            .{},
+            &body_out.writer,
+        ) catch return error.OutOfMemory;
+
+        const url = try self.endpointUrl(alloc, "");
+        defer alloc.free(url);
+        const res = try self.request(.PUT, url, body_out.writer.buffered(), false);
+        defer alloc.free(res.body);
+        if (res.status == 409) return error.PassportStaleBase;
+        if (!res.ok()) return self.setHttpError(res);
+
+        var res_parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
+            return error.PassportProtocol;
+        defer res_parsed.deinit();
+        if (res_parsed.value != .object) return error.PassportProtocol;
+
+        var result: CommitDeltaResult = .{};
+        errdefer result.deinit(alloc);
+        if (res_parsed.value.object.get("skipped")) |skipped_v| {
+            if (skipped_v == .array) {
+                for (skipped_v.array.items) |item| {
+                    if (item != .string) continue;
+                    const key_copy = try alloc.dupe(u8, item.string);
+                    errdefer alloc.free(key_copy);
+                    try result.skipped.append(alloc, key_copy);
+                }
+            }
+        }
+        if (res_parsed.value.object.get("deleted")) |del_v| {
+            if (del_v == .array) {
+                for (del_v.array.items) |item| {
+                    if (item != .string) continue;
+                    const key_copy = try alloc.dupe(u8, item.string);
+                    errdefer alloc.free(key_copy);
+                    try result.deleted.append(alloc, key_copy);
+                }
+            }
+        }
+        return result;
+    }
+
+    /// Persist the anti-rollback cursor {seq, canonical manifest hash}
+    /// under the configured state path. No-op when persistence is off.
+    /// Takes the candidate values explicitly so callers can persist
+    /// before committing them to in-memory state.
+    fn persistManifestState(self: *Client, seq: u64, hash: []const u8) Error!void {
+        const path = self.manifest_state_path orelse return;
+        const alloc = self.alloc;
+        if (std.fs.path.dirname(path)) |dir| {
+            io_mod.makeDirRecursive(dir) catch
+                return error.PassportStatePersistFailed;
+        }
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\n  \"seq\": {d},\n  \"canonical_sha256\": \"{s}\"\n}}\n",
+            .{ seq, hash },
+        );
+        defer alloc.free(body);
+        io_mod.writeFileAtomic(alloc, path, body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.PassportStatePersistFailed,
+        };
+    }
+
+    /// Rebuild the rotation chain from `identity/rotations/<seq>.json`
+    /// entries, verifying every attestation's linkage and predecessor
+    /// signature (PS-051/052). The manifest's signer authorization is
+    /// deferred until the chain is reconstructed: a manifest signed by an
+    /// intermediate key is legitimate once the chain covers it.
+    /// Returns the verified chain; the caller owns the slice and every
+    /// field inside it.
+    pub fn loadRotationChain(self: *Client, alloc: Allocator) Error![]identity.RotationAttestation {
+        var remote_opt = try self.remoteManifestMode(.defer_signer);
+        defer if (remote_opt) |*r| r.deinit(alloc);
+        const remote = remote_opt orelse
+            return try alloc.alloc(identity.RotationAttestation, 0);
+
+        var chain: std.ArrayList(identity.RotationAttestation) = .empty;
+        errdefer {
+            for (chain.items) |*a| freeAttestation(alloc, a);
+            chain.deinit(alloc);
+        }
+        var seq: u64 = 1;
+        while (true) : (seq += 1) {
+            const key = try std.fmt.allocPrint(alloc, "identity/rotations/{d}.json", .{seq});
+            defer alloc.free(key);
+            const expected = remote.entries.get(key) orelse break;
+            if (expected != .string) return error.PassportIntegrity;
+            const doc = try self.readVerifiedEntry(alloc, key, expected.string);
+            defer alloc.free(doc);
+            var att = try parseRotationAttestation(alloc, doc);
+            errdefer freeAttestation(alloc, &att);
+            if (att.seq != seq) return error.PassportIntegrity;
+            if (!std.mem.eql(u8, att.genesis_did, self.genesis_did))
+                return error.PassportIntegrity;
+            const signer: []const u8 = if (seq == 1)
+                self.genesis_did
+            else
+                chain.items[seq - 2].new_did;
+            var owned_prev: ?[]u8 = null;
+            defer if (owned_prev) |p| alloc.free(p);
+            const expected_prev: []const u8 = if (seq == 1)
+                identity.genesis_prev_hash
+            else blk: {
+                owned_prev = try identity.attestationHash(alloc, chain.items[seq - 2]);
+                break :blk owned_prev.?;
+            };
+            if (!std.mem.eql(u8, att.prev_hash, expected_prev))
+                return error.PassportIntegrity;
+            if (!identity.verifyRotationAttestation(alloc, att, signer))
+                return error.PassportIntegrity;
+            try chain.append(alloc, att);
+        }
+
+        if (!self.signerAuthorizedWithChain(remote.signer_did, chain.items))
+            return error.PassportIntegrity;
+        try self.adoptManifest(remote);
+        return try chain.toOwnedSlice(alloc);
+    }
+
+    /// Chain-aware signer check used while reconstructing the rotation
+    /// chain at open time: genesis, the active key, or any chain
+    /// successor may have signed the last manifest.
+    fn signerAuthorizedWithChain(
+        self: *const Client,
+        did: []const u8,
+        chain: []const identity.RotationAttestation,
+    ) bool {
+        if (std.mem.eql(u8, did, self.genesis_did)) return true;
+        if (std.mem.eql(u8, did, self.did)) return true;
+        for (chain) |att| {
+            if (std.mem.eql(u8, att.new_did, did)) return true;
+        }
+        return false;
     }
 
     // ─── Public operations ──────────────────────────────────────────────
@@ -969,15 +1261,41 @@ pub const Client = struct {
         defer if (hashes_opt) |*h| freeHashMap(alloc, h);
         var remote_opt = try self.remoteManifest();
         defer if (remote_opt) |*r| r.deinit(alloc);
-        if (remote_opt) |remote| self.adoptManifest(remote);
+        if (remote_opt) |remote| try self.adoptManifest(remote);
         const base_seq: u64 = if (remote_opt) |r| r.seq else 0;
 
-        const server_hashes: std.json.ObjectMap = if (hashes_opt) |h| h else .empty;
+        // The unsigned ?view=hashes response is only the server's claim
+        // about its own base state, never a source of keys for the signed
+        // manifest. Require it to agree exactly with the verified
+        // manifest's entries: a store reporting keys the holder never
+        // signed, or hiding signed keys, is lying (fail closed).
+        {
+            var view_count: usize = 0;
+            if (hashes_opt) |*view| {
+                var vit = view.iterator();
+                while (vit.next()) |kv| {
+                    if (std.mem.eql(u8, kv.key_ptr.*, manifest_entry_key)) continue;
+                    view_count += 1;
+                    if (kv.value_ptr.* != .string) return error.PassportIntegrity;
+                    const expected = if (remote_opt) |r|
+                        r.entries.get(kv.key_ptr.*)
+                    else
+                        null;
+                    if (expected == null or expected.? != .string or
+                        !std.mem.eql(u8, expected.?.string, kv.value_ptr.string))
+                        return error.PassportIntegrity;
+                }
+            }
+            const verified_count = if (remote_opt) |r| r.entries.count() else 0;
+            if (view_count != verified_count) return error.PassportIntegrity;
+        }
 
         var to_upload: std.json.ObjectMap = .empty;
         defer freeHashMap(alloc, &to_upload);
-        var next_hashes: std.json.ObjectMap = .empty;
-        defer freeHashMap(alloc, &next_hashes);
+        // Ciphertext hash per uploaded entry, needed to project the
+        // server's post-delta map for the manifest commit's base.
+        var uploaded_hashes: std.json.ObjectMap = .empty;
+        defer freeHashMap(alloc, &uploaded_hashes);
         var uploaded: std.ArrayList([]u8) = .empty;
         defer uploaded.deinit(alloc);
         var unchanged: std.ArrayList([]u8) = .empty;
@@ -985,22 +1303,6 @@ pub const Client = struct {
         errdefer {
             for (uploaded.items) |s| alloc.free(s);
             for (unchanged.items) |s| alloc.free(s);
-        }
-
-        var it = server_hashes.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.eql(u8, kv.key_ptr.*, manifest_entry_key)) continue;
-            const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
-            errdefer alloc.free(owned_key);
-            const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
-            errdefer alloc.free(owned_val);
-            try next_hashes.put(alloc, owned_key, .{ .string = owned_val });
-        }
-        for (user_deletions.items) |key| {
-            if (next_hashes.fetchOrderedRemove(key)) |kv| {
-                alloc.free(@constCast(kv.key));
-                alloc.free(@constCast(kv.value.string));
-            }
         }
 
         for (user_entries.items) |entry| {
@@ -1017,26 +1319,24 @@ pub const Client = struct {
                 }
             }
             if (!was_deleted) {
-                if (server_hashes.get(entry.key)) |existing| {
-                    if (std.mem.eql(u8, existing.string, hash)) {
-                        const key_copy = try alloc.dupe(u8, entry.key);
-                        errdefer alloc.free(key_copy);
-                        try unchanged.append(alloc, key_copy);
-                        continue;
+                if (remote_opt) |r| {
+                    if (r.entries.get(entry.key)) |existing| {
+                        if (existing == .string and std.mem.eql(u8, existing.string, hash)) {
+                            const key_copy = try alloc.dupe(u8, entry.key);
+                            errdefer alloc.free(key_copy);
+                            try unchanged.append(alloc, key_copy);
+                            continue;
+                        }
                     }
                 }
             }
 
-            if (next_hashes.fetchOrderedRemove(entry.key)) |old| {
-                alloc.free(@constCast(old.key));
-                alloc.free(@constCast(old.value.string));
-            }
             {
                 const owned_key = try alloc.dupe(u8, entry.key);
                 errdefer alloc.free(owned_key);
                 const owned_val = try alloc.dupe(u8, hash);
                 errdefer alloc.free(owned_val);
-                try next_hashes.put(alloc, owned_key, .{ .string = owned_val });
+                try uploaded_hashes.put(alloc, owned_key, .{ .string = owned_val });
             }
             {
                 const owned_key = try alloc.dupe(u8, entry.key);
@@ -1054,10 +1354,12 @@ pub const Client = struct {
 
         var changed = uploaded.items.len > 0;
         if (!changed) {
-            for (user_deletions.items) |key| {
-                if (server_hashes.get(key) != null) {
-                    changed = true;
-                    break;
+            if (remote_opt) |r| {
+                for (user_deletions.items) |key| {
+                    if (r.entries.get(key) != null) {
+                        changed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1071,7 +1373,76 @@ pub const Client = struct {
             };
         }
 
+        // Phase 1: commit the entry/deletion delta without the manifest so
+        // the server's per-entry verdict (skipped/deleted) is known before
+        // anything is signed.
+        var delta = try self.commitDelta(
+            alloc,
+            if (hashes_opt) |*h| h else null,
+            &to_upload,
+            user_deletions.items,
+        );
+        defer delta.deinit(alloc);
+
+        // Project the server's post-delta map: its reported view minus
+        // applied deletions, plus each entry it accepted. The manifest
+        // commit's base is computed over this map, so a store that
+        // rewrote state mid-push fails the base check.
+        var post_map: std.json.ObjectMap = .empty;
+        defer freeHashMap(alloc, &post_map);
+        if (hashes_opt) |*view| {
+            var vit = view.iterator();
+            while (vit.next()) |kv| {
+                const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
+                errdefer alloc.free(owned_key);
+                const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
+                errdefer alloc.free(owned_val);
+                try post_map.put(alloc, owned_key, .{ .string = owned_val });
+            }
+        }
+        // Prefer the server's confirmed deletion list; an older store that
+        // omits it applied the request's list.
+        if (delta.deleted.items.len > 0) {
+            for (delta.deleted.items) |key| {
+                if (post_map.fetchOrderedRemove(key)) |kv| {
+                    alloc.free(@constCast(kv.key));
+                    alloc.free(@constCast(kv.value.string));
+                }
+            }
+        } else {
+            for (user_deletions.items) |key| {
+                if (post_map.fetchOrderedRemove(key)) |kv| {
+                    alloc.free(@constCast(kv.key));
+                    alloc.free(@constCast(kv.value.string));
+                }
+            }
+        }
+        var uhit = uploaded_hashes.iterator();
+        while (uhit.next()) |kv| {
+            if (delta.containsSkipped(kv.key_ptr.*)) continue;
+            const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
+            errdefer alloc.free(owned_key);
+            const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
+            errdefer alloc.free(owned_val);
+            try post_map.put(alloc, owned_key, .{ .string = owned_val });
+        }
+
+        // The signed manifest's entry map: verified remote entries plus
+        // each accepted upload, minus applied deletions. It is derived
+        // from the projection, so it can never name a skipped key or a
+        // key only the unsigned view claimed.
         const seq = base_seq + 1;
+        var next_hashes: std.json.ObjectMap = .empty;
+        defer freeHashMap(alloc, &next_hashes);
+        var mit = post_map.iterator();
+        while (mit.next()) |kv| {
+            if (std.mem.eql(u8, kv.key_ptr.*, manifest_entry_key)) continue;
+            const owned_key = try alloc.dupe(u8, kv.key_ptr.*);
+            errdefer alloc.free(owned_key);
+            const owned_val = try alloc.dupe(u8, kv.value_ptr.string);
+            errdefer alloc.free(owned_val);
+            try next_hashes.put(alloc, owned_key, .{ .string = owned_val });
+        }
         const signed_manifest = try self.signManifest(&next_hashes, seq);
         defer alloc.free(signed_manifest.plaintext);
         defer alloc.free(signed_manifest.canonical);
@@ -1083,117 +1454,54 @@ pub const Client = struct {
             signed_manifest.plaintext,
         );
         defer alloc.free(manifest_blob);
+        var manifest_map: std.json.ObjectMap = .empty;
+        defer freeHashMap(alloc, &manifest_map);
         {
             const owned_key = try alloc.dupe(u8, manifest_entry_key);
             errdefer alloc.free(owned_key);
             const owned_val = try alloc.dupe(u8, manifest_blob);
             errdefer alloc.free(owned_val);
-            try to_upload.put(alloc, owned_key, .{ .string = owned_val });
+            try manifest_map.put(alloc, owned_key, .{ .string = owned_val });
         }
+
+        // Phase 2: commit the signed manifest alone, based on the
+        // post-delta map. A skipped manifest entry means the signed state
+        // did not commit.
+        var delta2 = try self.commitDelta(alloc, &post_map, &manifest_map, &.{});
+        defer delta2.deinit(alloc);
+        if (delta2.skipped.items.len > 0) return error.PassportSkipped;
+
+        try self.adoptLocalManifest(seq, signed_manifest.canonical);
+
         {
             const key_copy = try alloc.dupe(u8, manifest_entry_key);
             errdefer alloc.free(key_copy);
             try uploaded.append(alloc, key_copy);
         }
-
-        // PUT body: {base, entries, deletions?}.
-        var body_map: std.json.ObjectMap = .empty;
-        defer {
-            // entries/deletions children are owned separately; only the
-            // map shells free here.
-            if (body_map.get("entries")) |v| {
-                var m = v.object;
-                m.deinit(alloc);
-            }
-            if (body_map.get("deletions")) |v| {
-                var a = v.array;
-                a.deinit();
-            }
-            body_map.deinit(alloc);
-        }
-        // `base` must outlive the block: body_map borrows the slice until
-        // the request body is serialized below.
-        var base_str: ?[]u8 = null;
-        defer if (base_str) |s| alloc.free(s);
-        if (hashes_opt == null) {
-            try body_map.put(alloc, "base", .null);
-        } else {
-            var hash_entries: std.ArrayList(Entry) = .empty;
-            defer hash_entries.deinit(alloc);
-            var hit = server_hashes.iterator();
-            while (hit.next()) |kv| {
-                try hash_entries.append(alloc, .{
-                    .key = kv.key_ptr.*,
-                    .plaintext = kv.value_ptr.string,
-                });
-            }
-            base_str = try manifestHash(alloc, hash_entries.items);
-            try body_map.put(alloc, "base", .{ .string = base_str.? });
-        }
-        var entries_arr: std.json.ObjectMap = .empty;
-        {
-            var uit = to_upload.iterator();
-            while (uit.next()) |kv| {
-                try entries_arr.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
-            }
-        }
-        try body_map.put(alloc, "entries", .{ .object = entries_arr });
-        if (user_deletions.items.len > 0) {
-            var del_arr = std.json.Array.init(alloc);
-            for (user_deletions.items) |key| {
-                try del_arr.append(.{ .string = key });
-            }
-            try body_map.put(alloc, "deletions", .{ .array = del_arr });
-        }
-
-        var body_out: std.Io.Writer.Allocating = .init(alloc);
-        defer body_out.deinit();
-        std.json.Stringify.value(
-            @as(std.json.Value, .{ .object = body_map }),
-            .{},
-            &body_out.writer,
-        ) catch return error.OutOfMemory;
-
-        const url = try self.endpointUrl(alloc, "");
-        defer alloc.free(url);
-        const res = try self.request(.PUT, url, body_out.writer.buffered(), false);
-        defer alloc.free(res.body);
-        if (res.status == 409) return error.PassportStaleBase;
-        if (!res.ok()) return self.setHttpError(res);
-
-        var res_parsed = std.json.parseFromSlice(std.json.Value, alloc, res.body, .{}) catch
-            return error.PassportProtocol;
-        defer res_parsed.deinit();
-        if (res_parsed.value != .object) return error.PassportProtocol;
-        if (res_parsed.value.object.get("skipped")) |skipped_v| {
-            if (skipped_v == .array and skipped_v.array.items.len > 0)
-                return error.PassportSkipped;
-        }
-
-        self.last_seq = seq;
-        if (self.last_manifest_canonical) |old| alloc.free(old);
-        self.last_manifest_canonical = try alloc.dupe(u8, signed_manifest.canonical);
-
-        var deleted: std.ArrayList([]u8) = .empty;
-        defer deleted.deinit(alloc);
-        errdefer for (deleted.items) |s| alloc.free(s);
-        if (res_parsed.value.object.get("deleted")) |del_v| {
-            if (del_v == .array) {
-                for (del_v.array.items) |item| {
-                    if (item != .string) continue;
-                    const key_copy = try alloc.dupe(u8, item.string);
-                    errdefer alloc.free(key_copy);
-                    try deleted.append(alloc, key_copy);
+        // Accepted uploads only: keys the store refused are removed from
+        // the report.
+        if (delta.skipped.items.len > 0) {
+            var kept: std.ArrayList([]u8) = .empty;
+            defer kept.deinit(alloc);
+            for (uploaded.items) |key| {
+                if (delta.containsSkipped(key)) {
+                    alloc.free(key);
+                    continue;
                 }
+                try kept.append(alloc, key);
             }
+            uploaded.deinit(alloc);
+            uploaded = kept;
+            kept = .empty;
         }
+        if (delta.skipped.items.len > 0) return error.PassportSkipped;
 
         return .{
             .namespace = self.namespace,
             .seq = seq,
             .uploaded = try uploaded.toOwnedSlice(alloc),
             .unchanged = try unchanged.toOwnedSlice(alloc),
-            .deleted = try deleted.toOwnedSlice(alloc),
+            .deleted = try delta.deleted.toOwnedSlice(alloc),
         };
     }
 
@@ -1214,7 +1522,7 @@ pub const Client = struct {
                 .entries = try alloc.alloc(Entry, 0),
             };
         };
-        self.adoptManifest(remote);
+        try self.adoptManifest(remote);
 
         var entries: std.ArrayList(Entry) = .empty;
         errdefer {
@@ -1348,7 +1656,7 @@ pub const Client = struct {
         var remote_opt = try self.remoteManifest();
         defer if (remote_opt) |*r| r.deinit(alloc);
         const remote = remote_opt orelse return null;
-        self.adoptManifest(remote);
+        try self.adoptManifest(remote);
         const expected = remote.entries.get(entry_key) orelse return null;
         return try self.readVerifiedEntry(alloc, entry_key, expected.string);
     }
@@ -1366,9 +1674,9 @@ pub const Client = struct {
             alloc.free(results);
         }
         var remote_opt = try self.remoteManifest();
-        defer if (remote_opt) |*r| r.deinit(alloc);
+        defer if (remote_opt) |*r| r.deinit(self.alloc);
         const remote = remote_opt orelse return results;
-        self.adoptManifest(remote);
+        try self.adoptManifest(remote);
         for (entry_keys, 0..) |entry_key, i| {
             const expected = remote.entries.get(entry_key) orelse continue;
             results[i] = try self.readVerifiedEntry(alloc, entry_key, expected.string);
@@ -1425,6 +1733,48 @@ pub const Client = struct {
         return attestation;
     }
 };
+
+/// Free a RotationAttestation whose fields were allocated by `alloc`
+/// (the parseRotationAttestation shape, not the borrowed-fields shape
+/// produced by buildRotationAttestation).
+fn freeAttestation(alloc: Allocator, att: *identity.RotationAttestation) void {
+    alloc.free(@constCast(att.genesis_did));
+    alloc.free(@constCast(att.new_did));
+    alloc.free(@constCast(att.prev_hash));
+    alloc.free(@constCast(att.sig));
+}
+
+/// Parse a stored `identity/rotations/<seq>.json` document
+/// ({genesisDid, newDid, seq, prevHash, sig}) into an owned
+/// RotationAttestation. The stored form may carry a trailing newline.
+fn parseRotationAttestation(
+    alloc: Allocator,
+    doc: []const u8,
+) error{ OutOfMemory, PassportIntegrity }!identity.RotationAttestation {
+    const trimmed = std.mem.trimEnd(u8, doc, " \t\r\n");
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch
+        return error.PassportIntegrity;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.PassportIntegrity;
+    const obj = parsed.value.object;
+    const genesis_v = obj.get("genesisDid") orelse return error.PassportIntegrity;
+    const new_v = obj.get("newDid") orelse return error.PassportIntegrity;
+    const seq_v = obj.get("seq") orelse return error.PassportIntegrity;
+    const prev_v = obj.get("prevHash") orelse return error.PassportIntegrity;
+    const sig_v = obj.get("sig") orelse return error.PassportIntegrity;
+    if (genesis_v != .string or new_v != .string or prev_v != .string or
+        sig_v != .string or seq_v != .integer or seq_v.integer < 0)
+        return error.PassportIntegrity;
+    var att: identity.RotationAttestation = .{
+        .genesis_did = try alloc.dupe(u8, genesis_v.string),
+        .new_did = try alloc.dupe(u8, new_v.string),
+        .seq = @intCast(seq_v.integer),
+        .prev_hash = try alloc.dupe(u8, prev_v.string),
+        .sig = try alloc.dupe(u8, sig_v.string),
+    };
+    errdefer freeAttestation(alloc, &att);
+    return att;
+}
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
@@ -1551,4 +1901,284 @@ test "HttpTransport frames an empty body for bodied methods" {
     const head = probe.head[0..probe.head_len];
     try std.testing.expect(std.mem.startsWith(u8, head, "POST /auth/challenge HTTP/1.1\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, head, "content-length: 0") != null);
+}
+
+// ─── Wire-level tests through the scripted server ───────────────────────
+
+const test_server = @import("test_server.zig");
+
+const test_seed = [_]u8{9} ** 32;
+const test_passphrase = "wire-test-passphrase";
+
+/// Identity + scripted server + client, wired so `client.transport` points
+/// at the fixture's own (address-stable) server.
+const WireFixture = struct {
+    id: identity.Identity = undefined,
+    server: test_server.Server = undefined,
+    client: Client = undefined,
+
+    fn init(self: *WireFixture, alloc: Allocator) !void {
+        self.id = try identity.identityFromSeed(alloc, test_seed);
+        self.server = test_server.Server.init(alloc);
+        self.client = try Client.init(alloc, self.server.transport(), .{
+            .url = "http://passport.test",
+            .key_pair = self.id.key_pair,
+            .did = self.id.did,
+            .passphrase = test_passphrase,
+        });
+    }
+
+    fn deinit(self: *WireFixture, alloc: Allocator) void {
+        self.client.deinit();
+        self.server.deinit();
+        self.id.deinit(alloc);
+    }
+
+    fn encKey(self: *const WireFixture, alloc: Allocator) ![crypto.key_len]u8 {
+        return crypto.deriveKey(alloc, test_passphrase, self.client.namespace);
+    }
+
+    /// Seed one ciphertext entry plus the signed seq-1 manifest naming it.
+    /// The manifest blob registers both at ?view=integrity and under the
+    /// manifest entry key, matching a real store's state.
+    fn seedSignedEntry(
+        self: *WireFixture,
+        alloc: Allocator,
+        key: []const u8,
+        plaintext: []const u8,
+    ) !void {
+        const enc_key = try self.encKey(alloc);
+        const blob = try crypto.encryptEntry(alloc, &enc_key, key, plaintext);
+        defer alloc.free(blob);
+        try self.server.putEntry(key, blob);
+        const hash = try crypto.ciphertextHash(alloc, blob);
+        defer alloc.free(hash);
+        const entry_hashes = [_]Entry{.{ .key = key, .plaintext = hash }};
+        const manifest = try test_server.signedManifestBlob(
+            alloc,
+            &enc_key,
+            &self.id.key_pair,
+            self.id.did,
+            self.id.did,
+            1,
+            &entry_hashes,
+        );
+        defer alloc.free(manifest.canonical);
+        defer alloc.free(manifest.blob);
+        try self.server.putEntry(manifest_entry_key, manifest.blob);
+        if (self.server.integrity_blob) |old| alloc.free(old);
+        self.server.integrity_blob = try alloc.dupe(u8, manifest.blob);
+    }
+};
+
+test "auth signs the domain-separated nonce preimage" {
+    const alloc = std.testing.allocator;
+    var f: WireFixture = .{};
+    try f.init(alloc);
+    defer f.deinit(alloc);
+
+    try f.client.authenticate();
+
+    const body = f.server.verify_body orelse return error.TestExpectedVerifyBody;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const obj = parsed.value.object;
+    const nonce = obj.get("nonce").?.string;
+    const sig = obj.get("sig").?.string;
+    try std.testing.expectEqualStrings("test-nonce-1", nonce);
+
+    const preimage = try std.fmt.allocPrint(alloc, "passport-auth:{s}", .{nonce});
+    defer alloc.free(preimage);
+    // The signature verifies against the domain-separated preimage and
+    // never against the bare nonce.
+    try std.testing.expect(identity.verifyDidSignature(alloc, f.id.did, preimage, sig));
+    try std.testing.expect(!identity.verifyDidSignature(alloc, f.id.did, nonce, sig));
+}
+
+test "push signs only verified entries plus accepted uploads" {
+    const alloc = std.testing.allocator;
+    var f: WireFixture = .{};
+    try f.init(alloc);
+    defer f.deinit(alloc);
+    try f.seedSignedEntry(alloc, "memory/old.md", "old contents");
+
+    const upload = [_]Entry{.{ .key = "memory/new.md", .plaintext = "new contents" }};
+    const deletions = [_][]const u8{"memory/old.md"};
+    var result = try f.client.push(&upload, &deletions);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u64, 2), result.seq);
+    try std.testing.expectEqual(@as(usize, 2), result.uploaded.len);
+    try std.testing.expectEqual(@as(usize, 1), result.deleted.len);
+    try std.testing.expectEqualStrings("memory/old.md", result.deleted[0]);
+
+    // The server's committed manifest names only the accepted upload: the
+    // deleted key is gone and no view-only key leaked in.
+    const committed = f.server.entries.get(manifest_entry_key) orelse
+        return error.TestExpectedManifest;
+    const enc_key = try f.encKey(alloc);
+    const plaintext = try crypto.decryptEntry(alloc, &enc_key, manifest_entry_key, committed);
+    defer alloc.free(plaintext);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, plaintext, .{});
+    defer parsed.deinit();
+    const signed_entries = parsed.value.object.get("manifest").?.object.get("entries").?.object;
+    try std.testing.expectEqual(@as(usize, 1), signed_entries.count());
+    try std.testing.expect(signed_entries.get("memory/new.md") != null);
+    try std.testing.expect(f.server.entries.get("memory/new.md") != null);
+    try std.testing.expect(f.server.entries.get("memory/old.md") == null);
+}
+
+test "push fails closed when the hashes view diverges from the verified manifest" {
+    const alloc = std.testing.allocator;
+    const upload = [_]Entry{.{ .key = "memory/new.md", .plaintext = "new contents" }};
+
+    for ([_]test_server.ViewTamper{ .extra_key, .drop_key, .wrong_hash }) |tamper| {
+        var f: WireFixture = .{};
+        try f.init(alloc);
+        defer f.deinit(alloc);
+        try f.seedSignedEntry(alloc, "memory/old.md", "old contents");
+        f.server.tamper = tamper;
+        try std.testing.expectError(
+            error.PassportIntegrity,
+            f.client.push(&upload, &.{}),
+        );
+    }
+}
+
+test "manifest seq floor and same-seq hash check fail closed" {
+    const alloc = std.testing.allocator;
+
+    // Rollback: a remote seq below the client's floor is rejected.
+    {
+        var f: WireFixture = .{};
+        try f.init(alloc);
+        defer f.deinit(alloc);
+        try f.seedSignedEntry(alloc, "memory/a.md", "a");
+        f.client.last_seq = 5;
+        try std.testing.expectError(error.PassportIntegrity, f.client.pull());
+    }
+
+    // Same seq, different canonical manifest: rejected by the hash check.
+    {
+        var f: WireFixture = .{};
+        try f.init(alloc);
+        defer f.deinit(alloc);
+        try f.seedSignedEntry(alloc, "memory/a.md", "a");
+
+        // Record what the client verified, then swap the remote manifest
+        // for a different document at the same seq.
+        try std.testing.expect(f.client.last_manifest_hash == null);
+        const pull_result = try f.client.pull();
+        defer {
+            for (pull_result.entries) |e| {
+                alloc.free(@constCast(e.key));
+                alloc.free(@constCast(e.plaintext));
+            }
+            alloc.free(pull_result.entries);
+        }
+        try std.testing.expect(f.client.last_manifest_hash != null);
+
+        const enc_key = try f.encKey(alloc);
+        const swapped = try test_server.signedManifestBlob(
+            alloc,
+            &enc_key,
+            &f.id.key_pair,
+            f.id.did,
+            f.id.did,
+            1,
+            &.{},
+        );
+        defer alloc.free(swapped.canonical);
+        defer alloc.free(swapped.blob);
+        if (f.server.integrity_blob) |old| alloc.free(old);
+        f.server.integrity_blob = try alloc.dupe(u8, swapped.blob);
+
+        try std.testing.expectError(error.PassportIntegrity, f.client.pull());
+    }
+}
+
+test "manifest-state cursor persists and reloads across clients" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const state_path = try std.fs.path.join(
+        alloc,
+        &.{ home, "passport", "manifest-state.json" },
+    );
+    defer alloc.free(state_path);
+
+    var f: WireFixture = .{};
+    try f.init(alloc);
+    defer f.deinit(alloc);
+    f.server.namespace_missing = true;
+    f.client.manifest_state_path = try alloc.dupe(u8, state_path);
+
+    const upload = [_]Entry{.{ .key = "memory/x.md", .plaintext = "x" }};
+    var result = try f.client.push(&upload, &.{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.seq);
+
+    // The cursor file holds the committed seq and canonical hash.
+    var file = try tmp.dir.openFile(
+        std.testing.io,
+        "passport/manifest-state.json",
+        .{},
+    );
+    const body = try io_mod.readFileToEnd(alloc, &file, 4096);
+    file.close(std.testing.io);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 1), obj.get("seq").?.integer);
+    try std.testing.expectEqualStrings(
+        f.client.last_manifest_hash.?,
+        obj.get("canonical_sha256").?.string,
+    );
+
+    // A restarted client restores the floor from the file and accepts the
+    // same verified manifest.
+    const committed = f.server.entries.get(manifest_entry_key).?;
+    if (f.server.integrity_blob) |old| alloc.free(old);
+    f.server.integrity_blob = try alloc.dupe(u8, committed);
+    f.server.namespace_missing = false;
+
+    var client2 = try Client.init(alloc, f.server.transport(), .{
+        .url = "http://passport.test",
+        .key_pair = f.id.key_pair,
+        .did = f.id.did,
+        .passphrase = test_passphrase,
+        .last_seq = 1,
+        .last_manifest_hash = obj.get("canonical_sha256").?.string,
+    });
+    defer client2.deinit();
+    const pull_result = try client2.pull();
+    defer {
+        for (pull_result.entries) |e| {
+            alloc.free(@constCast(e.key));
+            alloc.free(@constCast(e.plaintext));
+        }
+        alloc.free(pull_result.entries);
+    }
+    try std.testing.expectEqual(@as(u64, 1), pull_result.seq);
+
+    // A same-seq swap still fails closed for the restarted client.
+    const enc_key = try f.encKey(alloc);
+    const swapped = try test_server.signedManifestBlob(
+        alloc,
+        &enc_key,
+        &f.id.key_pair,
+        f.id.did,
+        f.id.did,
+        1,
+        &.{},
+    );
+    defer alloc.free(swapped.canonical);
+    defer alloc.free(swapped.blob);
+    alloc.free(f.server.integrity_blob.?);
+    f.server.integrity_blob = try alloc.dupe(u8, swapped.blob);
+    try std.testing.expectError(error.PassportIntegrity, client2.pull());
 }

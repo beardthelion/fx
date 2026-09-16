@@ -124,36 +124,30 @@ fn unsetEnvPosix(key: []const u8) void {
     _ = unsetenv(buf[0..key.len :0]);
 }
 
-/// Capture every FX_PASSPORT_* entry from `raw_env`, then remove them in
-/// place so downstream environ blocks (and therefore spawned children)
-/// never see them. Call once, before io_mod.setRawEnviron, in the process
-/// entry path.
-pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) void {
+/// Capture every FX_PASSPORT_* entry from `raw_env` without mutating it,
+/// and install the clone-time scrub hook so child environments still drop
+/// the secrets. Hosts embedding fx (napi) call this: the host's libc
+/// environ is not ours to rewrite. Capture failure is fatal to the
+/// caller — a secret we failed to keep must not silently fall back to
+/// "disabled".
+pub fn captureRawEnv(alloc: Allocator, raw_env: io_mod.RawEnviron) error{OutOfMemory}!void {
     installEnvScrub();
     captured_mutex.lockUncancelable(io_mod.getIo());
     defer captured_mutex.unlock(io_mod.getIo());
 
     var map: std.StringHashMapUnmanaged([]const u8) = captured orelse .empty;
 
-    // Pass 1: capture names and values. raw_env aliases libc environ, and
-    // unsetenv compacts that array in place — calling it here would shift
-    // the entries not yet visited, silently skipping the variable that
-    // slid into the current slot. Nothing may mutate the array while this
-    // loop walks it.
+    // raw_env may alias libc environ; nothing may mutate that array while
+    // this loop walks it.
     var i: usize = 0;
     while (raw_env[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (!isPassportEnvEntry(entry)) continue;
-        const key = alloc.dupe(u8, envKey(entry)) catch continue;
-        const value = alloc.dupe(u8, envValue(entry)) catch {
-            alloc.free(key);
-            continue;
-        };
-        const gop = map.getOrPut(alloc, key) catch {
-            alloc.free(key);
-            alloc.free(value);
-            continue;
-        };
+        const key = try alloc.dupe(u8, envKey(entry));
+        errdefer alloc.free(key);
+        const value = try alloc.dupe(u8, envValue(entry));
+        errdefer alloc.free(value);
+        const gop = try map.getOrPut(alloc, key);
         if (gop.found_existing) {
             // Repeat capture of the same name (a second entry point calling
             // in): keep the stored key, refresh the value.
@@ -163,12 +157,26 @@ pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) void {
         gop.value_ptr.* = value;
     }
     captured = map;
+}
+
+/// Capture every FX_PASSPORT_* entry from `raw_env`, then remove them in
+/// place so downstream environ blocks (and therefore spawned children)
+/// never see them. Call once, before io_mod.setRawEnviron, in the process
+/// entry path. Only the owning process entry point may call this — it
+/// rewrites the libc environ array.
+pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) error{OutOfMemory}!void {
+    try captureRawEnv(alloc, raw_env);
+
+    captured_mutex.lockUncancelable(io_mod.getIo());
+    defer captured_mutex.unlock(io_mod.getIo());
 
     // Pass 2: tell libc to drop its bookkeeping for each captured key. The
     // walk above is finished, so environ compaction is safe now. This is a
     // no-op on non-libc builds.
-    var it = map.iterator();
-    while (it.next()) |kv| unsetEnvPosix(kv.key_ptr.*);
+    if (captured) |map| {
+        var it = map.iterator();
+        while (it.next()) |kv| unsetEnvPosix(kv.key_ptr.*);
+    }
 
     // Pass 3: compact the array in place. The envp pointer array is
     // process-writable memory (libc rewrites it on setenv), so this is
@@ -298,19 +306,23 @@ pub fn resolve(alloc: Allocator, home: []const u8) !?Config {
     }
 
     // Environment wins over settings.json (fx's standard precedence), and
-    // can also explicitly disable.
+    // can also explicitly disable. An explicit FX_PASSPORT_ENABLED=0 takes
+    // precedence over everything else, including a URL that would
+    // otherwise imply enablement.
+    var explicit_disable = false;
     if (envValueFor(env_enabled)) |value| {
         if (truthy(value)) {
             enabled = true;
         } else if (falsy(value)) {
             enabled = false;
+            explicit_disable = true;
         }
     }
     if (envValueFor(env_url)) |value| {
         if (value.len > 0) {
             if (url) |old| alloc.free(old);
             url = try alloc.dupe(u8, value);
-            enabled = true;
+            if (!explicit_disable) enabled = true;
         }
     }
     if (envValueFor(env_namespace)) |value| {
@@ -371,7 +383,7 @@ test "captureAndScrubRaw captures then strips FX_PASSPORT_* entries" {
     env_buf[entries.len] = null;
     const raw_env: io_mod.RawEnviron = @ptrCast(&env_buf);
 
-    captureAndScrubRaw(alloc, raw_env);
+    try captureAndScrubRaw(alloc, raw_env);
     defer {
         // Release captured entries so the test allocator stays clean.
         captured_mutex.lockUncancelable(std.testing.io);
@@ -452,7 +464,7 @@ test "captureAndScrubRaw captures every adjacent FX_PASSPORT_* var from the real
     }
 
     const raw_env: io_mod.RawEnviron = @ptrCast(std.c.environ);
-    captureAndScrubRaw(alloc, raw_env);
+    try captureAndScrubRaw(alloc, raw_env);
 
     // All three must be captured, not just the first — a removal that
     // shifts the array mid-iteration would silently drop the neighbours.
@@ -494,4 +506,48 @@ test "resolve reads the settings.json passport block only" {
     defer config.deinit(alloc);
     try std.testing.expectEqualStrings("http://localhost:8080", config.url);
     try std.testing.expect(config.scan_mode == .block);
+}
+
+test "explicit FX_PASSPORT_ENABLED=0 beats settings and URL enablement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    try tmp.dir.createDir(std.testing.io, ".fx", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".fx/settings.json",
+        .data = "{\"passport\":{\"enabled\":true,\"url\":\"http://localhost:8080\"}}",
+    });
+
+    // The captured env carries both the explicit disable and a URL that
+    // would otherwise imply enablement.
+    const entries = [_][:0]u8{
+        try alloc.dupeZ(u8, "FX_PASSPORT_ENABLED=0"),
+        try alloc.dupeZ(u8, "FX_PASSPORT_URL=http://localhost:9"),
+    };
+    defer for (entries) |e| alloc.free(e);
+    var env_buf: [3]?[*:0]const u8 = undefined;
+    for (entries, 0..) |e, i| env_buf[i] = e.ptr;
+    env_buf[entries.len] = null;
+    const raw_env: io_mod.RawEnviron = @ptrCast(&env_buf);
+
+    try captureRawEnv(alloc, raw_env);
+    defer {
+        captured_mutex.lockUncancelable(std.testing.io);
+        if (captured) |*map| {
+            var it = map.iterator();
+            while (it.next()) |kv| {
+                alloc.free(@constCast(kv.key_ptr.*));
+                alloc.free(@constCast(kv.value_ptr.*));
+            }
+            map.deinit(alloc);
+            captured = null;
+        }
+        captured_mutex.unlock(std.testing.io);
+    }
+
+    // An explicit disable wins over both the settings block and the URL.
+    try std.testing.expect((try resolve(alloc, home)) == null);
 }

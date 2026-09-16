@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const identity = @import("identity.zig");
+const shared_types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -64,11 +65,8 @@ pub const fx_tool_names = struct {
     pub const agent_spawn = [_][]const u8{"subagent"};
 };
 
-/// The fx tool names a grant action maps onto. An unrecognized class maps
-/// to nothing — foreign grants outside the defined vocabulary are never
-/// honored at all.
-pub fn mappedToolNames(action: []const u8) []const []const u8 {
-    const class = ActionClass.fromName(action) orelse return &.{};
+/// The fx tool names an action class maps onto.
+pub fn mappedToolsForClass(class: ActionClass) []const []const u8 {
     return switch (class) {
         .fs_read => &fx_tool_names.fs_read,
         .fs_write => &fx_tool_names.fs_write,
@@ -76,6 +74,14 @@ pub fn mappedToolNames(action: []const u8) []const []const u8 {
         .net_fetch => &fx_tool_names.net_fetch,
         .agent_spawn => &fx_tool_names.agent_spawn,
     };
+}
+
+/// The fx tool names a grant action maps onto. An unrecognized class maps
+/// to nothing — foreign grants outside the defined vocabulary are never
+/// honored at all.
+pub fn mappedToolNames(action: []const u8) []const []const u8 {
+    const class = ActionClass.fromName(action) orelse return &.{};
+    return mappedToolsForClass(class);
 }
 
 fn stringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
@@ -167,47 +173,12 @@ pub fn isExpired(grant: Grant, now_ms: i64) bool {
     return isoExpired(exp, now_ms);
 }
 
-/// Conservative ISO-8601 expiry check: only a full YYYY-MM-DDTHH:MM:SSZ
-/// shape is interpreted; anything else is treated as not-yet-checkable and
-/// the grant is skipped rather than honored.
+/// Conservative ISO-8601 expiry check: only a timestamp the shared
+/// gateway parser accepts is interpreted; anything else is treated as
+/// not-yet-checkable and the grant is skipped rather than honored.
 fn isoExpired(iso: []const u8, now_ms: i64) bool {
-    const epoch_ms = parseIso8601Z(iso) orelse return true; // unparseable: skip
+    const epoch_ms = shared_types.parseGatewayTimestamp(iso) catch return true; // unparseable: skip
     return epoch_ms <= now_ms;
-}
-
-fn parseIso8601Z(iso: []const u8) ?i64 {
-    // Minimal strict parser for "YYYY-MM-DDTHH:MM:SS(.sss)?Z".
-    if (iso.len < 20) return null;
-    if (iso[4] != '-' or iso[7] != '-' or iso[10] != 'T' or
-        iso[13] != ':' or iso[16] != ':') return null;
-    const year = std.fmt.parseInt(i64, iso[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(u8, iso[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(u8, iso[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(u8, iso[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(u8, iso[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(u8, iso[17..19], 10) catch return null;
-    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or
-        minute > 59 or second > 59) return null;
-    var idx: usize = 19;
-    if (idx < iso.len and iso[idx] == '.') {
-        idx += 1;
-        while (idx < iso.len and std.ascii.isDigit(iso[idx])) idx += 1;
-    }
-    if (idx != iso.len - 1 or iso[idx] != 'Z') return null;
-
-    return daysFromCivil(year, month, day) * 86400_000 +
-        @as(i64, hour) * 3600_000 + @as(i64, minute) * 60_000 + @as(i64, second) * 1000;
-}
-
-/// Days since the unix epoch for a civil date (Howard Hinnant's algorithm).
-fn daysFromCivil(y: i64, m: u8, d: u8) i64 {
-    const yy = if (m <= 2) y - 1 else y;
-    const era = @divFloor(yy, 400);
-    const yoe = yy - era * 400;
-    const mm: i64 = m;
-    const doy = @divFloor(153 * (if (mm > 2) mm - 3 else mm + 9) + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -251,7 +222,7 @@ test "expired grants are never presentable" {
         .granted_at = "2026-01-01T00:00:00Z",
         .expires_at = "2026-02-01T00:00:00Z",
     };
-    const later_ms = parseIso8601Z("2026-03-01T00:00:00Z").?;
+    const later_ms = shared_types.parseGatewayTimestamp("2026-03-01T00:00:00Z") catch unreachable;
     try std.testing.expect(isExpired(grant, later_ms));
     try std.testing.expect(!isExpired(grant, 0));
     // An unparseable expiry counts as expired: an unchecked expiry is

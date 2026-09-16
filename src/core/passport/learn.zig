@@ -231,16 +231,19 @@ pub fn captureSessionEnd(
     defer alloc.free(bytes);
 
     // One manifest fetch+verify covers every per-line collision check
-    // below; without it each candidate would re-fetch the manifest.
+    // below; without it each candidate would re-fetch the manifest. A
+    // list failure propagates: checking collisions against an empty set
+    // we did not actually fetch would silently overwrite distinct
+    // learnings that share a slug.
     var existing: std.StringHashMapUnmanaged(void) = .empty;
     defer existing.deinit(alloc);
-    if (store.listSurface(alloc, "memory/") catch null) |listed| {
-        defer {
-            for (listed) |k| alloc.free(k);
-            alloc.free(listed);
-        }
-        for (listed) |k| try existing.put(alloc, k, {});
+    // `listed` must outlive `existing`: the map borrows its key slices.
+    const listed = try store.listSurface(alloc, "memory/");
+    defer {
+        for (listed) |k| alloc.free(k);
+        alloc.free(listed);
     }
+    for (listed) |k| try existing.put(alloc, k, {});
 
     var keys: std.ArrayList([]u8) = .empty;
     defer {
@@ -267,9 +270,13 @@ pub fn captureSessionEnd(
         }
         // Same slug, different content: disambiguate with a content hash
         // suffix so neither learning is lost.
-        if (try collides(alloc, store, rendered, &existing)) |with_suffix| {
+        const with_suffix = collides(alloc, store, rendered, &existing) catch |err| {
             rendered.deinit(alloc);
-            rendered = with_suffix;
+            return err;
+        };
+        if (with_suffix) |ws| {
+            rendered.deinit(alloc);
+            rendered = ws;
         }
         // keys/values own the rendered buffers; seen borrows key slices
         // that outlive it (its deinit runs first).
@@ -285,15 +292,17 @@ pub fn captureSessionEnd(
 /// If a remote entry already exists at `rendered.key` with different
 /// content, re-render under a hash-suffixed slug. Returns null when there
 /// is no collision or the existing entry holds the same bytes. `existing`
-/// is the memory/ key set fetched once by the caller.
+/// is the memory/ key set fetched once by the caller. A read failure
+/// propagates: an unverifiable collision must not silently overwrite the
+/// entry already at the slug.
 fn collides(
     alloc: Allocator,
     store: *store_redirect.Store,
     rendered: Rendered,
     existing: *const std.StringHashMapUnmanaged(void),
-) Allocator.Error!?Rendered {
+) !?Rendered {
     if (!existing.contains(rendered.key)) return null;
-    const prior = (store.readSurface(alloc, rendered.key) catch return null) orelse return null;
+    const prior = (try store.readSurface(alloc, rendered.key)) orelse return null;
     defer alloc.free(prior);
     if (std.mem.eql(u8, prior, rendered.content)) return null;
     const suffix = try hex8(alloc, rendered.content);
@@ -301,7 +310,10 @@ fn collides(
     const stem = rendered.key[0 .. rendered.key.len - ".md".len];
     const key = try std.fmt.allocPrint(alloc, "{s}-{s}.md", .{ stem, suffix });
     errdefer alloc.free(key);
-    if (!client_mod.isValidEntryKey(key)) return null;
+    if (!client_mod.isValidEntryKey(key)) {
+        alloc.free(key);
+        return null;
+    }
     return .{ .key = key, .content = try alloc.dupe(u8, rendered.content) };
 }
 
@@ -310,6 +322,7 @@ fn collides(
 const testing = std.testing;
 
 const MockBackend = store_redirect.MockBackend;
+const test_server = @import("test_server.zig");
 
 fn sessionDir(alloc: Allocator, tmp: *testing.TmpDir) !io_mod.VerifiedDir {
     _ = alloc;
@@ -418,6 +431,48 @@ test "absent or empty sidecar writes nothing" {
     try io_mod.durableReplaceVerified(alloc, &session_vd, learnings_file, "\n\n");
     try captureSessionEnd(alloc, &store, &session_vd);
     try testing.expectEqual(@as(usize, 0), mock.entries.count());
+}
+
+test "collides propagates a read failure instead of overwriting the entry" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    // A remote entry already holds the slug the learning renders to, with
+    // different content: capture must read it back to disambiguate.
+    var mock = MockBackend{};
+    defer mock.deinit(alloc);
+    {
+        const k = try alloc.dupe(u8, "memory/user/prefers-pnpm.md");
+        errdefer alloc.free(k);
+        const v = try alloc.dupe(u8, "prior contents");
+        try mock.entries.put(alloc, k, v);
+    }
+    var flaky = test_server.FlakyBackend{
+        .inner = mock.backend(),
+        .fail_reads_left = 1,
+    };
+    var store = try store_redirect.Store.init(alloc, home, flaky.backend());
+    defer store.deinit();
+
+    var session_vd = try sessionDir(alloc, &tmp);
+    defer session_vd.close();
+    try io_mod.durableReplaceVerified(alloc, &session_vd, learnings_file,
+        \\{"type":"user","slug":"prefers-pnpm","title":"I prefer pnpm.","body":"I prefer pnpm."}
+        \\
+    );
+
+    try testing.expectError(
+        error.PassportUnavailable,
+        captureSessionEnd(alloc, &store, &session_vd),
+    );
+    // The prior entry is untouched.
+    try testing.expectEqualStrings(
+        "prior contents",
+        mock.entries.get("memory/user/prefers-pnpm.md").?,
+    );
 }
 
 test "explicit saveLearning lands one entry and no-ops when disabled" {

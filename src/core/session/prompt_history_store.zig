@@ -14,6 +14,9 @@ const max_record_bytes: usize = 256 * 1024;
 const compaction_threshold_bytes: u64 = 1024 * 1024;
 const compaction_record_limit: usize = 1000;
 const compaction_byte_limit: usize = 1024 * 1024;
+
+/// Read->merge->write retries on a stale-base verdict (PS-082).
+const stale_base_max_attempts: u8 = 3;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -440,6 +443,29 @@ pub const Store = struct {
     /// candidate back. The backend's manifest transaction is the
     /// atomicity boundary, so there is no indeterminate state to resolve.
     fn appendRemote(
+        self: *Store,
+        alloc: Allocator,
+        line: []const u8,
+        workspace_root: []const u8,
+        text: []const u8,
+    ) !AppendOutcome {
+        // A stale-base verdict means the remote moved under the
+        // read->merge->write cycle; retry the whole cycle, bounded, so a
+        // concurrent append cannot silently drop this one.
+        var attempt: u8 = 0;
+        while (true) {
+            attempt += 1;
+            return self.appendRemoteOnce(alloc, line, workspace_root, text) catch |err| switch (err) {
+                error.PassportStaleBase => {
+                    if (attempt >= stale_base_max_attempts) return err;
+                    continue;
+                },
+                else => |e| return e,
+            };
+        }
+    }
+
+    fn appendRemoteOnce(
         self: *Store,
         alloc: Allocator,
         line: []const u8,
@@ -1648,4 +1674,71 @@ test "passport-backed history appends dedupes loads and clears remotely" {
     defer freeLoadedEntries(alloc, kept);
     try std.testing.expectEqual(@as(usize, 1), kept.len);
     try std.testing.expectEqualStrings("other", kept[0].text);
+}
+
+const test_server = @import("../passport/test_server.zig");
+
+test "passport-backed append retries a stale base and keeps the record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var mock = RemoteHistoryBackend{};
+    defer mock.deinit(alloc);
+    // The first writeSurface answers PassportStaleBase; the bounded retry
+    // re-reads and rewrites instead of dropping the record.
+    var flaky = test_server.FlakyBackend{
+        .inner = mock.backend(),
+        .stale_writes_left = 1,
+    };
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    const backend_store = try alloc.create(store_redirect.Store);
+    backend_store.* = try store_redirect.Store.init(alloc, home, flaky.backend());
+    store.passport = backend_store;
+
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 1, "/tmp/workspace-a", "first"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), flaky.write_calls);
+    try std.testing.expect(mock.entries.get("config/history.jsonl") != null);
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 10);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("first", entries[0].text);
+}
+
+test "passport-backed append gives up after the bounded retries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var mock = RemoteHistoryBackend{};
+    defer mock.deinit(alloc);
+    // More stale verdicts than the retry budget covers.
+    var flaky = test_server.FlakyBackend{
+        .inner = mock.backend(),
+        .stale_writes_left = 3,
+    };
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    const backend_store = try alloc.create(store_redirect.Store);
+    backend_store.* = try store_redirect.Store.init(alloc, home, flaky.backend());
+    store.passport = backend_store;
+
+    try std.testing.expectError(
+        error.PassportStaleBase,
+        store.append(alloc, 1, "/tmp/workspace-a", "first"),
+    );
+    try std.testing.expect(mock.entries.get("config/history.jsonl") == null);
 }
