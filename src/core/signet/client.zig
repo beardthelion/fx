@@ -3,7 +3,7 @@
 //! Wraps crypto, identity, and the HTTP contract so callers work in
 //! plaintext and never touch ciphertext or the wire format. Encryption and
 //! signing happen in-process; the passphrase and private key never leave
-//! this machine. Everything the server can see stays inside the PS-034
+//! this machine. Everything the server can see stays inside the SN-034
 //! metadata boundary.
 //!
 //! Wire protocol:
@@ -28,7 +28,7 @@ const Allocator = std.mem.Allocator;
 
 pub const spec_version = "signet-spec/0.1";
 
-/// The entry carrying the signed integrity manifest (PS-040).
+/// The entry carrying the signed integrity manifest (SN-040).
 pub const manifest_entry_key = "identity/manifest.json";
 
 const default_timeout_ms: i64 = 120_000;
@@ -211,27 +211,27 @@ pub const Error = error{
     /// server's own error code when it sent one.
     SignetHttp,
     /// The signed integrity manifest failed verification or rollback
-    /// checks (PS-041). Fail closed.
+    /// checks (SN-041). Fail closed.
     SignetIntegrity,
     /// A blob did not decrypt with this client's key or its hash did not
     /// match the verified manifest.
     SignetDecrypt,
-    /// The server refused some entries of a push (PS-081: skipped, never a
+    /// The server refused some entries of a push (SN-081: skipped, never a
     /// silent drop).
     SignetSkipped,
     /// The request body or response could not be understood.
     SignetProtocol,
     /// The store reports a stale `base` (409): nothing committed.
     SignetStaleBase,
-    /// The persisted anti-rollback cursor could not be parsed (PS-041).
+    /// The persisted anti-rollback cursor could not be parsed (SN-041).
     /// Fail closed: an unreadable cursor must not reset the seq floor.
     SignetStateCorrupt,
     /// The anti-rollback cursor could not be persisted after a verified
     /// manifest adoption.
     SignetStatePersistFailed,
-    /// A pushed entry carried a credential-shaped secret (PS-110).
+    /// A pushed entry carried a credential-shaped secret (SN-110).
     SecretFound,
-    /// An entry key violated PS-020/021.
+    /// An entry key violated SN-020/021.
     InvalidEntryKey,
     /// The ciphertext payload was malformed (bad base64 or too short).
     CiphertextTooShort,
@@ -292,7 +292,7 @@ pub const PullResult = struct {
     entries: []Entry,
 };
 
-// ─── Entry-key validation (PS-020/021) ──────────────────────────────────
+// ─── Entry-key validation (SN-020/021) ──────────────────────────────────
 
 const entry_sections = [_][]const u8{ "memory", "config", "sessions", "grants", "identity" };
 
@@ -306,7 +306,7 @@ pub fn isValidSegment(seg: []const u8) bool {
     return true;
 }
 
-/// `sessions/<id>/<seq>` chunk suffix: six or more digits (PS-022).
+/// `sessions/<id>/<seq>` chunk suffix: six or more digits (SN-022).
 pub fn isChunkSeq(seg: []const u8) bool {
     if (seg.len < 6) return false;
     for (seg) |ch| {
@@ -341,7 +341,7 @@ pub fn isValidEntryKey(key: []const u8) bool {
     } else return false;
     if (std.mem.eql(u8, section, "sessions")) {
         // Session keys are exactly sessions/<id>/<seq>: a valid segment
-        // id plus a six-or-more-digit chunk sequence (PS-022).
+        // id plus a six-or-more-digit chunk sequence (SN-022).
         const id_seg = it.next() orelse return false;
         const seq_seg = it.next() orelse return false;
         if (it.next() != null) return false;
@@ -394,7 +394,7 @@ pub fn didDocument(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
 
 const VerifiedManifest = struct {
     seq: u64,
-    /// Canonical JSON of the signed manifest body (PS-041 same-seq check).
+    /// Canonical JSON of the signed manifest body (SN-041 same-seq check).
     canonical: []u8,
     /// Decrypted manifest entry plaintext.
     plaintext: []u8,
@@ -444,7 +444,7 @@ pub const Client = struct {
     encoded_namespace: []u8,
     token: ?Token = null,
     last_seq: u64,
-    /// sha256 hex of the last verified canonical manifest (PS-041). The
+    /// sha256 hex of the last verified canonical manifest (SN-041). The
     /// hash is what persists across restarts, so the same-seq check
     /// compares hashes rather than retaining canonical bytes.
     last_manifest_hash: ?[]u8 = null,
@@ -464,7 +464,7 @@ pub const Client = struct {
         did: []const u8,
         /// The signet's immutable root DID. Defaults to `did`.
         genesis_did: ?[]const u8 = null,
-        /// Explicit namespace override (PS-012): pins a namespace that
+        /// Explicit namespace override (SN-012): pins a namespace that
         /// differs from the genesis-DID-derived one (post-rotation
         /// holder). The entry key is derived against this namespace.
         /// Callers validate the shape before passing it in.
@@ -473,13 +473,13 @@ pub const Client = struct {
         attestations: []const identity.RotationAttestation = &.{},
         /// Passphrase the entry key is derived from. Never sent.
         passphrase: []const u8,
-        /// Secret-scan policy before encryption. Default block (PS-110).
+        /// Secret-scan policy before encryption. Default block (SN-110).
         scan_mode: secretscan.ScanMode = .block,
-        /// Last verified manifest seq (PS-041 anti-rollback).
+        /// Last verified manifest seq (SN-041 anti-rollback).
         last_seq: u64 = 0,
         /// sha256 hex of the last verified canonical manifest, restored
         /// from persisted state so a restarted client still detects a
-        /// same-seq manifest swap (PS-041).
+        /// same-seq manifest swap (SN-041).
         last_manifest_hash: ?[]const u8 = null,
         /// Where the anti-rollback cursor persists ({seq, canonical
         /// manifest hash}), e.g. ~/.fx/signet/manifest-state.json.
@@ -609,9 +609,9 @@ pub const Client = struct {
         return std.fmt.allocPrint(alloc, "{s}{s}", .{ self.url, encoded.items });
     }
 
-    /// Challenge/response auth (PS-090): fresh nonce signed by the active
+    /// Challenge/response auth (SN-090): fresh nonce signed by the active
     /// key, exchanged for a bearer. The rotation chain rides along whenever
-    /// the active key is a successor (PS-052).
+    /// the active key is a successor (SN-052).
     fn authenticate(self: *Client) Error!void {
         const alloc = self.alloc;
         const challenge_url = try std.fmt.allocPrint(alloc, "{s}/auth/challenge", .{self.url});
@@ -632,7 +632,7 @@ pub const Client = struct {
         defer alloc.free(nonce);
 
         // The signed preimage is domain-separated so a nonce can never be
-        // replayed as some other document's signature (PS-090).
+        // replayed as some other document's signature (SN-090).
         const preimage = try std.fmt.allocPrint(alloc, "signet-auth:{s}", .{nonce});
         defer alloc.free(preimage);
         const sig = try identity.signMessage(alloc, &self.key_pair, preimage);
@@ -816,7 +816,7 @@ pub const Client = struct {
         return .{ .ok = try alloc.dupe(u8, entry_v.string) };
     }
 
-    // ─── Integrity manifest (PS-040/041) ────────────────────────────────
+    // ─── Integrity manifest (SN-040/041) ────────────────────────────────
 
     /// The DIDs allowed to have signed an integrity manifest: genesis, the
     /// active key, and every successor named by the rotation chain.
@@ -960,7 +960,7 @@ pub const Client = struct {
 
     /// The remote manifest was cryptographically verified; adopt its seq
     /// and canonical hash as the local anti-rollback state and persist
-    /// the cursor (PS-041). The write happens before the in-memory swap
+    /// the cursor (SN-041). The write happens before the in-memory swap
     /// so a failed persist leaves the previous seq/hash fully intact and
     /// a mid-adoption error cannot blank the same-seq check.
     fn adoptManifest(self: *Client, verified: VerifiedManifest) Error!void {
@@ -1120,7 +1120,7 @@ pub const Client = struct {
 
     /// Rebuild the rotation chain from `identity/rotations/<seq>.json`
     /// entries, verifying every attestation's linkage and predecessor
-    /// signature (PS-051/052). The manifest's signer authorization is
+    /// signature (SN-051/052). The manifest's signer authorization is
     /// deferred until the chain is reconstructed: a manifest signed by an
     /// intermediate key is legitimate once the chain covers it.
     /// Returns the verified chain; the caller owns the slice and every
@@ -1205,7 +1205,7 @@ pub const Client = struct {
 
     /// Encrypt + delta-push entries, then publish the next signed manifest.
     /// Plaintext is scanned for credential shapes BEFORE encryption
-    /// (PS-110). `identity/manifest.json` is client-managed: a
+    /// (SN-110). `identity/manifest.json` is client-managed: a
     /// caller-supplied entry under that key is dropped.
     pub fn push(
         self: *Client,
@@ -1230,7 +1230,7 @@ pub const Client = struct {
             try user_deletions.append(alloc, key);
         }
 
-        // Secret scan before encryption (PS-110). Findings move to
+        // Secret scan before encryption (SN-110). Findings move to
         // last_scan_findings so a SecretFound error still reports them.
         if (self.last_scan_findings) |f| secretscan.freeFindings(alloc, f);
         self.last_scan_findings = null;
@@ -1505,7 +1505,7 @@ pub const Client = struct {
         };
     }
 
-    /// Pull + decrypt every entry named by the verified manifest (PS-041).
+    /// Pull + decrypt every entry named by the verified manifest (SN-041).
     /// Each blob's ciphertext hash is checked against the manifest before
     /// decryption — a blob the manifest does not name, or that fails GCM,
     /// is a hard error, never a silent skip.
@@ -1649,7 +1649,7 @@ pub const Client = struct {
     }
 
     /// Read and decrypt one entry, verified against the signed manifest
-    /// (PS-041). Returns null when the signet does not exist or the
+    /// (SN-041). Returns null when the signet does not exist or the
     /// manifest does not name the key.
     pub fn readEntry(self: *Client, entry_key: []const u8) Error!?[]u8 {
         const alloc = self.alloc;
@@ -1684,7 +1684,7 @@ pub const Client = struct {
         return results;
     }
 
-    /// Rotate the signing key (PS-050/051): sign the attestation with the
+    /// Rotate the signing key (SN-050/051): sign the attestation with the
     /// CURRENT key and record it under identity/rotations/<seq>.json.
     /// The caller owns the returned attestation's sig.
     pub fn rotate(
@@ -1778,7 +1778,7 @@ fn parseRotationAttestation(
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
-test "entry key validation enforces PS-020/021" {
+test "entry key validation enforces SN-020/021" {
     try std.testing.expect(isValidEntryKey("memory/MEMORY.md"));
     try std.testing.expect(isValidEntryKey("sessions/demo/000001"));
     try std.testing.expect(isValidEntryKey("config/settings.json"));
@@ -1791,7 +1791,7 @@ test "entry key validation enforces PS-020/021" {
     try std.testing.expect(!isValidEntryKey("memory"));
     try std.testing.expect(!isValidEntryKey("memory/-leading"));
     try std.testing.expect(!isValidEntryKey("memory/.hidden-ok")); // '.' first char invalid
-    // PS-022: sessions keys are exactly sessions/<id>/<6+digit seq>.
+    // SN-022: sessions keys are exactly sessions/<id>/<6+digit seq>.
     try std.testing.expect(!isValidEntryKey("sessions/demo/1"));
     try std.testing.expect(!isValidEntryKey("sessions/demo/session.json"));
     try std.testing.expect(!isValidEntryKey("sessions/demo/meta/index.json"));

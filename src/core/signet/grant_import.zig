@@ -1,6 +1,6 @@
 //! Pending-grant listing and the signet grant record path.
 //!
-//! Read path (PS-061): `listPending` lists `grants/` entries that map onto
+//! Read path (SN-061): `listPending` lists `grants/` entries that map onto
 //! fx's tool model and are still holder-decidable; `/permissions signet`
 //! resolves one with `findPending`, applies it to the permission engine,
 //! and journals the explicit decision with `recordDecision` so a grant is
@@ -8,7 +8,7 @@
 //! and produce no journal entry: no decision was made, so nothing is
 //! decided permanently.
 //!
-//! Write path (PS-062): `recordToolGrant` is the only route that writes
+//! Write path (SN-062): `recordToolGrant` is the only route that writes
 //! `grants/` entries, and callers invoke it only for grants the holder
 //! confirmed. Decided grants are applied straight to the engine rather
 //! than through that path, so a confirmed decision never echoes back as a
@@ -219,7 +219,7 @@ pub fn findPending(pending: []grants.GrantDoc, id: []const u8) ?*grants.GrantDoc
     return null;
 }
 
-// ─── Record path (PS-062) ───────────────────────────────────────────────
+// ─── Record path (SN-062) ───────────────────────────────────────────────
 
 /// The action class an fx tool name reverse-maps to, if any. Tools with
 /// no signet class produce no grant record. Iterating the enum fields
@@ -296,7 +296,7 @@ pub fn openSignetStoreFromEnv(alloc: Allocator) !?store_redirect.Store {
     return store;
 }
 
-/// Record a holder-confirmed session grant into the signet (PS-062).
+/// Record a holder-confirmed session grant into the signet (SN-062).
 /// Best-effort outside the authority lock: a record failure must not
 /// stall or fail the local grant, so it logs and returns instead.
 pub fn recordSessionGrantBestEffort(alloc: Allocator, tool_name: []const u8, scope: []const u8) void {

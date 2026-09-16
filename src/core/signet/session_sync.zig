@@ -3,7 +3,7 @@
 //! commits mirror best-effort into signet entries, and a missing local
 //! directory is hydrated from the mirror when a session is opened by id.
 //!
-//! Remote layout conforms to the sessions key grammar (PS-020/PS-022):
+//! Remote layout conforms to the sessions key grammar (SN-020/SN-022):
 //! every entry under a session is `sessions/<id>/<seq>` with a
 //! zero-padded six-digit sequence.
 //!   sessions/<id>/000000      mirror manifest (index)
@@ -27,7 +27,7 @@ const session_layout = @import("../session/session_layout.zig");
 const Allocator = std.mem.Allocator;
 
 /// Plaintext bytes per chunk entry. Keeps each ciphertext entry well
-/// under the spec's 1 MiB per-entry cap (PS-081).
+/// under the spec's 1 MiB per-entry cap (SN-081).
 pub const event_chunk_bytes: usize = 512 * 1024;
 
 const seq_width = 6;
@@ -63,7 +63,7 @@ fn sessionPrefix(alloc: Allocator, session_id: []const u8) Allocator.Error![]u8 
     return std.fmt.allocPrint(alloc, "sessions/{s}", .{session_id});
 }
 
-/// `sessions/<id>/<seq>` with seq zero-padded to six digits (PS-022).
+/// `sessions/<id>/<seq>` with seq zero-padded to six digits (SN-022).
 fn chunkRel(alloc: Allocator, session_id: []const u8, seq: u64) Allocator.Error![]u8 {
     return std.fmt.allocPrint(
         alloc,
@@ -310,7 +310,7 @@ pub fn mirrorSession(
         // Scan the assembled file before it is chunked: the per-entry
         // scan the backend applies inside push sees each 512KiB chunk in
         // isolation, so a credential straddling a boundary would pass as
-        // two clean halves (PS-110).
+        // two clean halves (SN-110).
         const scan_key = try std.fmt.allocPrint(
             alloc,
             "sessions/{s}/{s}",
@@ -581,7 +581,7 @@ test "mirror then hydrate reproduces the session directory" {
 
     try mirrorSession(alloc, &store, &session_vd, "sess001");
 
-    // Every remote key conforms to sessions/<id>/<seq> (PS-022).
+    // Every remote key conforms to sessions/<id>/<seq> (SN-022).
     try testing.expect(mock.entries.get("sessions/sess001/000000") != null);
     try testing.expect(mock.entries.get("sessions/sess001/000001") != null);
     try testing.expect(mock.entries.get("sessions/sess001/000002") != null);

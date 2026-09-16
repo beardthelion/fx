@@ -260,7 +260,7 @@ fn readSettingsBlock(alloc: Allocator, home: []const u8) !?SettingsSignet {
 }
 
 /// Read a 0600 custody file under ~/.fx/signet/. Refuses group/other
-/// access bits, per PS-101.
+/// access bits, per SN-101.
 fn readCustodyFile(alloc: Allocator, home: []const u8, name: []const u8) !?[]u8 {
     const dir_path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, custody_dir_name });
     defer alloc.free(dir_path);

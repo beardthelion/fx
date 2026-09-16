@@ -1,14 +1,14 @@
 //! Holder identity: did:key encoding, Ed25519 signing, canonical JSON, and
-//! rotation attestations (PS-001, PS-010/011, PS-050..053).
+//! rotation attestations (SN-001, SN-010/011, SN-050..053).
 //!
-//! A signet is rooted at exactly one genesis DID (PS-010): a `did:key`
+//! A signet is rooted at exactly one genesis DID (SN-010): a `did:key`
 //! Ed25519 identity created at init. The private key is one of the two
-//! secrets that govern the signet (PS-100); it lives client-side only.
+//! secrets that govern the signet (SN-100); it lives client-side only.
 //! What crosses the wire is the DID itself (public), Ed25519 signatures
 //! over server nonces and canonical-JSON documents, and rotation
 //! attestations.
 //!
-//! The DID encoding (PS-001) is `did:key:z` + base58btc(0xed01 || pubkey).
+//! The DID encoding (SN-001) is `did:key:z` + base58btc(0xed01 || pubkey).
 //! base58btc is implemented locally and matches the reference encoder in
 //! signet-suite (src/client/identity.ts) byte for byte, so the shared
 //! vectors in spec/vectors/{identity,rotation}.json reproduce exactly.
@@ -27,7 +27,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const b58_alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-/// base58btc encode with the multibase 'z' prefix (PS-001).
+/// base58btc encode with the multibase 'z' prefix (SN-001).
 /// The caller owns the returned slice.
 pub fn base58btc(alloc: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     var digits: std.ArrayList(u8) = .empty;
@@ -273,7 +273,7 @@ pub fn verifyDidSignature(
     return true;
 }
 
-// ─── Namespaces (PS-011) ────────────────────────────────────────────────
+// ─── Namespaces (SN-011) ────────────────────────────────────────────────
 
 /// `did:key:z6Mk...` -> `did_key_z6Mk...` — the injective namespace encoding.
 /// The caller owns the returned slice.
@@ -283,7 +283,7 @@ pub fn encodeDid(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
     return out;
 }
 
-/// The namespace a genesis DID owns: `signet:<encoded did>` (PS-011).
+/// The namespace a genesis DID owns: `signet:<encoded did>` (SN-011).
 /// The caller owns the returned slice.
 pub fn namespaceFor(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
     const encoded = try encodeDid(alloc, did);
@@ -292,7 +292,7 @@ pub fn namespaceFor(alloc: Allocator, did: []const u8) Allocator.Error![]u8 {
 }
 
 /// Inverse of namespaceFor: recover the genesis DID a `signet:` namespace
-/// pins (PS-012). The caller owns the returned slice; null when the
+/// pins (SN-012). The caller owns the returned slice; null when the
 /// namespace does not decode back to a well-formed did:key identity.
 pub fn didFromNamespace(alloc: Allocator, namespace: []const u8) Allocator.Error!?[]u8 {
     const prefix = "signet:";
@@ -306,7 +306,7 @@ pub fn didFromNamespace(alloc: Allocator, namespace: []const u8) Allocator.Error
     return did;
 }
 
-/// PS-012: encoded namespaces must match this shape before storage access.
+/// SN-012: encoded namespaces must match this shape before storage access.
 pub fn isValidNamespace(namespace: []const u8) bool {
     const prefix = "signet:did_";
     if (!std.mem.startsWith(u8, namespace, prefix)) return false;
@@ -325,9 +325,9 @@ pub fn isValidNamespace(namespace: []const u8) bool {
     return true;
 }
 
-// ─── Rotation attestations (PS-050/051) ─────────────────────────────────
+// ─── Rotation attestations (SN-050/051) ─────────────────────────────────
 
-/// prevHash of the first attestation in a chain (PS-051).
+/// prevHash of the first attestation in a chain (SN-051).
 pub const genesis_prev_hash = "0" ** 64;
 
 pub const RotationAttestation = struct {
@@ -362,7 +362,7 @@ fn attestationBodyValue(
 }
 
 /// Canonical JSON of the unsigned attestation body {genesisDid, newDid,
-/// seq, prevHash} — the exact bytes the predecessor key signs (PS-051).
+/// seq, prevHash} — the exact bytes the predecessor key signs (SN-051).
 /// The caller owns the returned slice.
 pub fn canonicalAttestationBody(
     alloc: Allocator,
@@ -398,7 +398,7 @@ pub fn attestationHash(alloc: Allocator, att: RotationAttestation) Allocator.Err
     return sha256Hex(alloc, canonical);
 }
 
-/// Build a rotation attestation (PS-051): the predecessor key signs the
+/// Build a rotation attestation (SN-051): the predecessor key signs the
 /// canonical JSON of {genesisDid, newDid, seq, prevHash}. The successor's
 /// own signature is not part of the document — control of the old key is
 /// the whole authorization.
@@ -422,7 +422,7 @@ pub fn buildRotationAttestation(
     };
 }
 
-/// Verify one attestation's structure and predecessor signature (PS-051):
+/// Verify one attestation's structure and predecessor signature (SN-051):
 /// the sig must be a valid Ed25519 signature, under `signer_did`, over the
 /// canonical JSON of {genesisDid, newDid, seq, prevHash}. Chain ordering
 /// (seq strictly increasing, prevHash linkage) is the caller's check.
@@ -513,7 +513,7 @@ test "namespaceFor and encodeDid match the vector namespace" {
     try std.testing.expect(!isValidNamespace("signet:did:key:z6Mk"));
     try std.testing.expect(!isValidNamespace("other:did_key_z6Mk"));
 
-    // Successor DID encodes to a different namespace (PS-053).
+    // Successor DID encodes to a different namespace (SN-053).
     const successor = parsed.value.object.get("successorDid").?.string;
     const successor_ns = try namespaceFor(alloc, successor);
     defer alloc.free(successor_ns);

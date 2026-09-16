@@ -1,13 +1,13 @@
-//! Grant vocabulary (PS-060..062) and the mapping into fx's action model.
+//! Grant vocabulary (SN-060..062) and the mapping into fx's action model.
 //!
 //! A signet grant is `{id, action, scope, constraints, granted_by,
 //! granted_at, expires_at?}` recorded under `grants/`. Grants are NEVER
-//! silently honored across harness boundaries (PS-061): an incoming grant
+//! silently honored across harness boundaries (SN-061): an incoming grant
 //! is mapped onto fx's own tool/permission model and the holder must
 //! confirm before it takes effect. There is no automatic grant-application
 //! path: the holder decides through `/permissions signet`
 //! (grant_import.zig), and the only write path for grant records is
-//! `buildGrantRecord` (PS-062).
+//! `buildGrantRecord` (SN-062).
 
 const std = @import("std");
 const identity = @import("identity.zig");
@@ -15,7 +15,7 @@ const shared_types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// PS-060 action classes.
+/// SN-060 action classes.
 pub const ActionClass = enum {
     fs_read,
     fs_write,
@@ -42,7 +42,7 @@ pub const ActionClass = enum {
     }
 };
 
-/// A grant document as stored under grants/ (PS-060). Slices borrow from
+/// A grant document as stored under grants/ (SN-060). Slices borrow from
 /// the parsed JSON or caller buffers.
 pub const Grant = struct {
     id: []const u8,
@@ -148,7 +148,7 @@ pub fn parseGrantDoc(alloc: Allocator, json_bytes: []const u8) !?GrantDoc {
 }
 
 /// Serialize a holder-confirmed grant record for storage under grants/
-/// (PS-062). Canonical JSON, no whitespace. The caller owns the slice.
+/// (SN-062). Canonical JSON, no whitespace. The caller owns the slice.
 pub fn buildGrantRecord(alloc: Allocator, grant: Grant) ![]u8 {
     var map: std.json.ObjectMap = .empty;
     defer map.deinit(alloc);

@@ -8,7 +8,7 @@
 //!   sessions/<...>         -> sessions/<...>
 //!   grants/<...>           -> grants/<...>   (recorded permission grants)
 //!   memories.json          -> memory/memories.json
-//!   memory/<type>/<slug>.md -> memory/<...>  (learned entries, PS-120/KTD8)
+//!   memory/<type>/<slug>.md -> memory/<...>  (learned entries, SN-120/KTD8)
 //!   history.jsonl          -> config/history.jsonl
 //!   mcp.json               -> config/mcp.json
 //!
@@ -61,7 +61,7 @@ fn routePath(alloc: Allocator, rel_path: []const u8) Allocator.Error!Route {
         // sessions/latest/ is the local resume cache, never a session.
         if (std.mem.eql(u8, rest, "latest") or
             std.mem.startsWith(u8, rest, "latest/")) return .local;
-        // The sessions surface is exactly sessions/<id>/<seq> (PS-022).
+        // The sessions surface is exactly sessions/<id>/<seq> (SN-022).
         // Anything else under sessions/ stays local rather than emitting
         // an entry key the store would reject.
         if (!client_mod.isValidEntryKey(rel_path)) return .local;
@@ -133,7 +133,7 @@ pub const Backend = struct {
         /// (the real file or surface name). Backends that chunk content
         /// before pushing need this: the per-entry scan inside push sees
         /// each chunk in isolation, so a credential straddling a chunk
-        /// boundary would evade it (PS-110). Null means no assembled
+        /// boundary would evade it (SN-110). Null means no assembled
         /// scan; callers may skip the call entirely when local.
         scan: ?*const fn (
             ptr: *anyopaque,
@@ -253,7 +253,7 @@ fn localList(alloc: Allocator, dir_rel: []const u8, dir_path: []const u8) Backen
 }
 
 /// Signet-backed implementation: entries are secret-scanned, encrypted,
-/// and pushed through the client (PS-030/032/033/110).
+/// and pushed through the client (SN-030/032/033/110).
 pub const SignetBackend = struct {
     client: *client_mod.Client,
 
@@ -285,7 +285,7 @@ pub const SignetBackend = struct {
         return try alloc.dupe(u8, remote);
     }
 
-    /// One manifest fetch+verify covers the whole batch (PS-041).
+    /// One manifest fetch+verify covers the whole batch (SN-041).
     fn readBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError![]?[]u8 {
         const self: *SignetBackend = @ptrCast(@alignCast(ptr));
         return self.client.readEntries(alloc, keys);
@@ -379,7 +379,7 @@ pub const SignetBackend = struct {
     }
 
     /// Warn-mode secret scan reports into debug_trace so a committed
-    /// credential shape is visible without blocking the write (PS-110).
+    /// credential shape is visible without blocking the write (SN-110).
     fn traceWarnFindings(self: *SignetBackend) void {
         if (self.client.scan_mode != .warn) return;
         const findings = self.client.scanFindings() orelse return;
@@ -469,7 +469,7 @@ pub const Store = struct {
     /// Kept alive for the Store's lifetime: client.did/genesis_did borrow
     /// the identity's DID allocation.
     identity: ?identity.Identity = null,
-    /// Namespace-derived genesis DID (post-rotation holder, PS-012). Kept
+    /// Namespace-derived genesis DID (post-rotation holder, SN-012). Kept
     /// alive because client.genesis_did borrows the slice.
     genesis_did: ?[]u8 = null,
     /// Verified rotation chain loaded at open. Kept alive because
@@ -508,7 +508,7 @@ pub const Store = struct {
             }
 
             // Restore the persisted anti-rollback cursor so a restarted
-            // client still enforces the seq floor (PS-041).
+            // client still enforces the seq floor (SN-041).
             const state_path = try std.fs.path.join(
                 alloc,
                 &.{ home, profile_paths.root_dir_name, "signet", "manifest-state.json" },
@@ -552,7 +552,7 @@ pub const Store = struct {
             if (cfg.namespace != null) {
                 // A pinned namespace may point at a signet whose holder
                 // rotated keys: rebuild and verify the chain, then adopt
-                // it for auth and manifest signer checks (PS-051/052).
+                // it for auth and manifest signer checks (SN-051/052).
                 store.rotation_chain = try store.client.?.loadRotationChain(alloc);
                 errdefer {
                     for (store.rotation_chain) |*att| {
@@ -897,7 +897,7 @@ pub fn destroyOwned(store: *Store) void {
     alloc.destroy(store);
 }
 
-/// The persisted anti-rollback cursor for a signet namespace (PS-041).
+/// The persisted anti-rollback cursor for a signet namespace (SN-041).
 const ManifestState = struct {
     seq: u64,
     /// sha256 hex of the last verified canonical manifest. Owned slice.
@@ -1075,7 +1075,7 @@ test "routePath maps the enumerated surfaces and nothing else" {
         "sessions", // bare dir, no trailing path
         "sessions/../escape",
         "sessions/bad segment/x",
-        // Non-chunk sessions paths are not valid entry keys (PS-022).
+        // Non-chunk sessions paths are not valid entry keys (SN-022).
         "sessions/abc/session.json",
         "sessions/abc/meta/index.json",
         "sessions/latest/pointer.json",
@@ -1169,7 +1169,7 @@ test "enabled store routes signet surfaces through the backend only" {
         std.Io.Dir.openFileAbsolute(std.testing.io, local_path, .{}),
     );
 
-    // Session chunk surfaces map under sessions/<id>/<seq> (PS-022).
+    // Session chunk surfaces map under sessions/<id>/<seq> (SN-022).
     try store.writeSurface(alloc, "sessions/s1/000001", "{}");
     try std.testing.expect(mock.entries.get("sessions/s1/000001") != null);
     // Non-chunk sessions paths are not valid entry keys and stay local.

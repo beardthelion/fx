@@ -957,7 +957,7 @@ pub fn Handlers(comptime App: type) type {
 
         /// `/permissions signet` — list, confirm, or deny grants recorded
         /// under the signet's grants/ surface. Grant import is always an
-        /// explicit holder action (PS-061): nothing auto-applies, and each
+        /// explicit holder action (SN-061): nothing auto-applies, and each
         /// decision is journaled so a grant is never re-presented.
         fn handleSignetGrants(app: *App, rest: []const u8) !void {
             if (comptime !@hasField(App, "permission_engine")) {

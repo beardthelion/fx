@@ -1,4 +1,4 @@
-//! Client-side secret scanner — defense in depth (PS-110).
+//! Client-side secret scanner — defense in depth (SN-110).
 //!
 //! A signet carries an agent's whole working state, and agents are
 //! excellent at accidentally writing "the API key is sk-..." into a note.

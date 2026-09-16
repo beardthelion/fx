@@ -1745,7 +1745,7 @@ const App = struct {
         self.recordSignetGrant(tool_name, target_path);
     }
 
-    /// Record a holder-confirmed session grant into the signet (PS-062).
+    /// Record a holder-confirmed session grant into the signet (SN-062).
     /// Only called for grants the holder already approved through fx's own
     /// prompts or commands. Best-effort outside the authority lock: a
     /// record failure must not stall or fail the local grant.

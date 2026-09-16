@@ -15,7 +15,7 @@ const compaction_threshold_bytes: u64 = 1024 * 1024;
 const compaction_record_limit: usize = 1000;
 const compaction_byte_limit: usize = 1024 * 1024;
 
-/// Read->merge->write retries on a stale-base verdict (PS-082).
+/// Read->merge->write retries on a stale-base verdict (SN-082).
 const stale_base_max_attempts: u8 = 3;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);

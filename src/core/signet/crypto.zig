@@ -1,19 +1,19 @@
-//! Client-side end-to-end encryption for the AI Signet (PS-030..035).
+//! Client-side end-to-end encryption for the AI Signet (SN-030..035).
 //!
 //! This module is the trust boundary made concrete: plaintext is encrypted
 //! here, on the holder's machine, before anything crosses the wire. A
 //! conformant store sees only ciphertext plus the bounded metadata of
-//! PS-034.
+//! SN-034.
 //!
 //! Crypto choices (matches src/client/crypto.ts in signet-suite, and
 //! spec/vectors/crypto.json byte for byte):
 //!   - Key derivation: scrypt(passphrase, salt = sha256("signet:" +
-//!     namespace), 32, {N: 2^15, r: 8, p: 1}) (PS-031).
-//!   - Cipher: AES-256-GCM with the entry key as AEAD AAD (PS-032).
+//!     namespace), 32, {N: 2^15, r: 8, p: 1}) (SN-031).
+//!   - Cipher: AES-256-GCM with the entry key as AEAD AAD (SN-032).
 //!   - Nonce: deterministic HMAC-SHA256(encKey, entryKey || 0x00 ||
-//!     plaintext)[0:12] (PS-033). Random nonces MUST NOT be substituted.
+//!     plaintext)[0:12] (SN-033). Random nonces MUST NOT be substituted.
 //!
-//! Wire/storage blob layout, then base64 (PS-030):
+//! Wire/storage blob layout, then base64 (SN-030):
 //!   [ 0x01 version ][ 12-byte nonce ][ 16-byte GCM tag ][ ciphertext ]
 
 const std = @import("std");
@@ -39,7 +39,7 @@ pub const Error = error{
     OutputTooLong,
 };
 
-/// Derive the 32-byte signet key from a passphrase + namespace (PS-031).
+/// Derive the 32-byte signet key from a passphrase + namespace (SN-031).
 pub fn deriveKey(
     alloc: Allocator,
     passphrase: []const u8,
@@ -61,7 +61,7 @@ pub fn deriveKey(
     return key;
 }
 
-/// HMAC-SHA256(key, entryKey || 0x00 || plaintext)[0:12] (PS-033).
+/// HMAC-SHA256(key, entryKey || 0x00 || plaintext)[0:12] (SN-033).
 fn deterministicNonce(
     key: *const [key_len]u8,
     entry_key: []const u8,
@@ -78,7 +78,7 @@ fn deterministicNonce(
     return nonce;
 }
 
-/// Encrypt one entry's plaintext -> base64 ciphertext blob (PS-030/032/033).
+/// Encrypt one entry's plaintext -> base64 ciphertext blob (SN-030/032/033).
 /// The caller owns the returned slice.
 pub fn encryptEntry(
     alloc: Allocator,

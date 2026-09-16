@@ -1,4 +1,4 @@
-//! Session-end learning capture for the signet backend (spec PS-120;
+//! Session-end learning capture for the signet backend (spec SN-120;
 //! suite plan KTD8 / unit U7).
 //!
 //! The authoritative distillation lives in the signet-suite TypeScript
@@ -15,12 +15,12 @@
 //! The sidecar is harness-owned scratch state: absent or empty means the
 //! session produced nothing worth learning and nothing is written.
 //!
-//! Entries carry `type:` and `provenance: learned:fx` frontmatter (PS-120)
+//! Entries carry `type:` and `provenance: learned:fx` frontmatter (SN-120)
 //! and deliberately no timestamps or session ids: identical learned
 //! content must render byte-identical plaintext so deterministic
-//! encryption (PS-033) produces the same ciphertext hash and the manifest
+//! encryption (SN-033) produces the same ciphertext hash and the manifest
 //! dedupes a re-learned fact instead of duplicating it. The backend's own
-//! PS-110 secret scan applies on write, identical to every other
+//! SN-110 secret scan applies on write, identical to every other
 //! redirected surface.
 
 const std = @import("std");
