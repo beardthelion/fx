@@ -3070,7 +3070,7 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = python_code,
     }, 80);
     defer alloc.free(python);
-    try std.testing.expect(std.mem.indexOf(u8, python, "─ \x1b[2mpython\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[2m─ python ─") != null);
     try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
 
     const unknown_language = try alloc.dupe(u8, "brainfuck");
@@ -3122,7 +3122,7 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = code,
     }, 100);
     defer alloc.free(unlabeled);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "─ \x1b[2mts\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[2m─ ts ─") != null);
     try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
 
@@ -3135,7 +3135,7 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = json_code,
     }, 100);
     defer alloc.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "─ \x1b[2mjson\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[2m─ json ─") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
 
     const ambiguous_language = try alloc.dupe(u8, "");
@@ -3159,7 +3159,7 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = explicit_unknown_code,
     }, 100);
     defer alloc.free(explicit_unknown);
-    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "─ \x1b[2mbrainfuck\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[2m─ brainfuck ─") != null);
     try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[38;5;") == null);
 }
 
@@ -4103,7 +4103,7 @@ test "renderEntriesToBytes indents semantic table and code rows" {
     defer alloc.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "  ┌"));
     try std.testing.expect(std.mem.find(u8, out, "\n  │") != null);
-    try std.testing.expect(std.mem.find(u8, out, "\n\n  ─ \x1b[2mzig") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\n\n  \x1b[2m─ zig") != null);
 
     for (1..6) |width| {
         const cols: u16 = @intCast(width);
@@ -4297,7 +4297,7 @@ test "renderEntriesToBytes keeps semantic code as its own assistant entry" {
     defer alloc.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Before code.").? < std.mem.indexOf(u8, out, "const").?);
     try std.testing.expect(std.mem.indexOf(u8, out, "const").? < std.mem.indexOf(u8, out, "After code.").?);
-    try std.testing.expect(std.mem.find(u8, out, "─ \x1b[2mzig\x1b[22m ─") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[2m─ zig ─") != null);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[2mzig\x1b[22m\n─") == null);
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 6, .{});
