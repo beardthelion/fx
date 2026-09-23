@@ -7489,7 +7489,7 @@ test "memory tool uses isolated HOME and preserves outputs" {
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rejected.status);
     try std.testing.expectEqualStrings(
-        "memory field \"action\" must be one of: save, list, clear",
+        "memory field \"action\" must be one of: save, list, clear, learn",
         rejected.model_output,
     );
 
