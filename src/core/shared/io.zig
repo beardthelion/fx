@@ -4,6 +4,12 @@ const darwin_process_spawn = @import("darwin_process_spawn.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
+/// Same layout as RawEnviron but with writable slots: the envp pointer
+/// array is process memory the entry point may compact in place. The
+/// pointed-to strings stay const. Functions that rewrite the array must
+/// take this type so callers' reads are not folded to pre-call values.
+pub const MutRawEnviron = [*:null]?[*:0]const u8;
+
 // Process globals are installed before threads start and remain read-only.
 var real_io: ?std.Io = null;
 

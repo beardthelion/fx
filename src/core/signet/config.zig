@@ -164,7 +164,7 @@ pub fn captureRawEnv(alloc: Allocator, raw_env: io_mod.RawEnviron) error{OutOfMe
 /// never see them. Call once, before io_mod.setRawEnviron, in the process
 /// entry path. Only the owning process entry point may call this — it
 /// rewrites the libc environ array.
-pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) error{OutOfMemory}!void {
+pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.MutRawEnviron) error{OutOfMemory}!void {
     try captureRawEnv(alloc, raw_env);
 
     captured_mutex.lockUncancelable(io_mod.getIo());
@@ -181,16 +181,18 @@ pub fn captureAndScrubRaw(alloc: Allocator, raw_env: io_mod.RawEnviron) error{Ou
     // Pass 3: compact the array in place. The envp pointer array is
     // process-writable memory (libc rewrites it on setenv), so this is
     // safe; it also covers the non-libc build where pass 2 did nothing.
-    const mut_env: [*:null]?[*:0]const u8 = @ptrCast(@constCast(raw_env));
+    // raw_env arrives mutable (MutRawEnviron) so these stores are
+    // visible to the caller — writing through a const-qualified pointer
+    // would let the optimizer fold later reads back to the originals.
     var dst: usize = 0;
     var src: usize = 0;
     while (raw_env[src]) |entry_z| : (src += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (isSignetEnvEntry(entry)) continue;
-        mut_env[dst] = entry_z;
+        raw_env[dst] = entry_z;
         dst += 1;
     }
-    mut_env[dst] = null;
+    raw_env[dst] = null;
 }
 
 // ─── Config resolution ──────────────────────────────────────────────────
@@ -381,7 +383,7 @@ test "captureAndScrubRaw captures then strips FX_SIGNET_* entries" {
     var env_buf: [5]?[*:0]const u8 = undefined;
     for (entries, 0..) |e, i| env_buf[i] = e.ptr;
     env_buf[entries.len] = null;
-    const raw_env: io_mod.RawEnviron = @ptrCast(&env_buf);
+    const raw_env: io_mod.MutRawEnviron = @ptrCast(&env_buf);
 
     try captureAndScrubRaw(alloc, raw_env);
     defer {
@@ -463,7 +465,7 @@ test "captureAndScrubRaw captures every adjacent FX_SIGNET_* var from the real e
         }
     }
 
-    const raw_env: io_mod.RawEnviron = @ptrCast(std.c.environ);
+    const raw_env: io_mod.MutRawEnviron = @ptrCast(std.c.environ);
     try captureAndScrubRaw(alloc, raw_env);
 
     // All three must be captured, not just the first — a removal that

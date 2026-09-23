@@ -2992,7 +2992,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     // envp, environ blocks, and every child process never see them.
     // A capture failure is fatal — secrets we could not keep must not
     // silently degrade to "backend disabled".
-    try signet_config.captureAndScrubRaw(processAllocator(), raw_env);
+    try signet_config.captureAndScrubRaw(processAllocator(), @ptrCast(c_envp));
 
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
