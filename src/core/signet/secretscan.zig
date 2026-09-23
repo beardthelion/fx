@@ -599,26 +599,13 @@ fn expectFinding(alloc: Allocator, entry_key: []const u8, text: []const u8, rule
     for (findings) |f| {
         if (std.mem.eql(u8, f.rule, rule_id)) return;
     }
-    var names: std.ArrayList(u8) = .empty;
-    defer names.deinit(alloc);
-    for (findings) |f| {
-        try names.appendSlice(alloc, f.rule);
-        try names.append(alloc, ',');
-    }
-    std.debug.print("expected rule {s}, got findings: {s}\n", .{ rule_id, names.items });
     return error.TestExpectedFinding;
 }
 
 fn expectClean(alloc: Allocator, text: []const u8) !void {
     const findings = try scanEntry(alloc, "memory/test.md", text);
     defer freeFindings(alloc, findings);
-    if (findings.len != 0) {
-        std.debug.print("expected clean, got rule {s} at line {d}\n", .{
-            findings[0].rule,
-            findings[0].line,
-        });
-        return error.TestUnexpectedFinding;
-    }
+    if (findings.len != 0) return error.TestUnexpectedFinding;
 }
 
 test "scanner blocks known token shapes" {
