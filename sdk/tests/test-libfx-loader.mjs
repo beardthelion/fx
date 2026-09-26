@@ -48,11 +48,22 @@ const terminal = await createFxTerminal({ nativeAddon: nativeUrl, marker: 2 });
 assert.equal(terminal.backend, "native-terminal");
 assert.equal(terminal.options.marker, 2);
 
-await assert.rejects(
-  createFxAgent({ nativeAddon: nativeUrl, backend: "wasm" }),
-  (error) => error?.code === "LIBFX_JSPI_REQUIRED" &&
-    error.message.includes("--experimental-wasm-jspi"),
-);
+// Node 24 exposes JSPI unflagged, so simulate its absence rather than
+// assuming the flag is still required.
+const savedSuspending = WebAssembly.Suspending;
+const savedPromising = WebAssembly.promising;
+try {
+  Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: undefined });
+  Object.defineProperty(WebAssembly, "promising", { configurable: true, value: undefined });
+  await assert.rejects(
+    createFxAgent({ nativeAddon: nativeUrl, backend: "wasm" }),
+    (error) => error?.code === "LIBFX_JSPI_REQUIRED" &&
+      error.message.includes("--experimental-wasm-jspi"),
+  );
+} finally {
+  Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: savedSuspending });
+  Object.defineProperty(WebAssembly, "promising", { configurable: true, value: savedPromising });
+}
 
 const coreOnlyPath = resolve(dir, "core-only.mjs");
 await writeFile(coreOnlyPath, `
