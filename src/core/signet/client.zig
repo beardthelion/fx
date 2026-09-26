@@ -1152,13 +1152,13 @@ pub const Client = struct {
             const signer: []const u8 = if (seq == 1)
                 self.genesis_did
             else
-                chain.items[seq - 2].new_did;
+                chain.items[@intCast(seq - 2)].new_did;
             var owned_prev: ?[]u8 = null;
             defer if (owned_prev) |p| alloc.free(p);
             const expected_prev: []const u8 = if (seq == 1)
                 identity.genesis_prev_hash
             else blk: {
-                owned_prev = try identity.attestationHash(alloc, chain.items[seq - 2]);
+                owned_prev = try identity.attestationHash(alloc, chain.items[@intCast(seq - 2)]);
                 break :blk owned_prev.?;
             };
             if (!std.mem.eql(u8, att.prev_hash, expected_prev))
