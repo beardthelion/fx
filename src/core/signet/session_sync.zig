@@ -43,6 +43,16 @@ const index_seq: u64 = 0;
 /// Session-dir members mirrored into the signet. Everything else under
 /// the session directory stays local.
 fn isMirroredFile(name: []const u8) bool {
+    // Flat member names only: alnum-led, no separators or traversal.
+    // The commit.<hex>.json prefix/suffix test below would otherwise
+    // admit names like commit.x/../../e.json at index parse; writes are
+    // leaf-guarded downstream, but the parser should reject them here.
+    if (name.len == 0 or !std.ascii.isAlphanumeric(name[0])) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '-') {
+            return false;
+        }
+    }
     if (std.mem.eql(u8, name, events_file)) return true;
     for ([_][]const u8{
         "session.json",
@@ -743,6 +753,50 @@ test "hydrate rejects a torn mirror" {
     try testing.expectError(
         error.SignetMirrorCorrupt,
         hydrateSession(alloc, &store, &sessions_vd, "s1"),
+    );
+}
+
+test "hydrate rejects a mirror index naming a traversal member" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var mock = testBackend{};
+    defer mock.deinit(alloc);
+    var store = try store_redirect.Store.init(alloc, home, mock.backend());
+    defer store.deinit();
+
+    // The commit.*.json prefix/suffix test alone would accept this name;
+    // the member-shape check must reject it as corrupt before materialize.
+    const digest = try identity.sha256Hex(alloc, "x");
+    defer alloc.free(digest);
+    const index = try std.fmt.allocPrint(
+        alloc,
+        "{{\"v\":2,\"files\":[{{\"name\":\"commit.x/../../e.json\",\"first\":1,\"chunks\":1,\"bytes\":1,\"sha256\":\"{s}\"}}]}}",
+        .{digest},
+    );
+    defer alloc.free(index);
+    try putMockEntry(&mock, alloc, "sessions/s1/000000", index);
+    try putMockEntry(&mock, alloc, "sessions/s1/000001", "x");
+
+    var home_vd = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(
+        std.testing.io,
+        ".",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) };
+    defer home_vd.close();
+    var sessions_vd = try io_mod.openOrCreateVerifiedPrivateDir(&home_vd, "sessions");
+    defer sessions_vd.close();
+    try testing.expectError(
+        error.SignetMirrorCorrupt,
+        hydrateSession(alloc, &store, &sessions_vd, "s1"),
+    );
+    // Nothing materialized outside the session dir.
+    try testing.expectError(
+        error.FileNotFound,
+        sessions_vd.dir.access(io_mod.getIo(), "e.json", .{}),
     );
 }
 
