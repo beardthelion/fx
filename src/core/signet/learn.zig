@@ -22,6 +22,13 @@
 //! dedupes a re-learned fact instead of duplicating it. The backend's own
 //! SN-110 secret scan applies on write, identical to every other
 //! redirected surface.
+//!
+//! `project` entries additionally carry `scope:`: the basename of the
+//! workspace root the learning came from. A repo-bound fact like "we use
+//! pnpm" is only true of the repo it was learned in; the scope field
+//! keeps recall honest instead of applying it to whatever directory the
+//! next session happens to run in. Scope is ambient context injected by
+//! the caller, never agent-provided input.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -32,9 +39,11 @@ const store_redirect = @import("store_redirect.zig");
 const Allocator = std.mem.Allocator;
 
 const learnings_file = "learnings.jsonl";
+const session_meta_file = "session.json";
 const provenance = "learned:fx";
 
 pub const max_learnings_bytes: usize = 256 * 1024;
+const max_session_meta_bytes: usize = 64 * 1024;
 const max_learnings: usize = 64;
 const max_title_bytes: usize = 512;
 const max_body_bytes: usize = 64 * 1024;
@@ -122,10 +131,43 @@ fn hex8(alloc: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     return alloc.dupe(u8, hex[0..8]);
 }
 
+/// The basename of a workspace root, flattened to one YAML-safe line.
+/// Caller owns the result; null when the root is absent or has no usable
+/// leaf component.
+fn scopeFromRoot(alloc: Allocator, workspace_root: ?[]const u8) Allocator.Error!?[]u8 {
+    const root = workspace_root orelse return null;
+    const base = std.fs.path.basename(root);
+    if (base.len == 0 or std.mem.indexOfScalar(u8, base, '/') != null) return null;
+    return try flattenWhitespace(alloc, base);
+}
+
+/// Best-effort workspace scope from the session's session.json. Any
+/// failure yields null: scope is metadata, never a reason to drop a
+/// learning. Caller owns the result.
+fn sessionWorkspaceScope(alloc: Allocator, session_dir: *const io_mod.VerifiedDir) ?[]u8 {
+    var file = session_dir.dir.openFile(io_mod.getIo(), session_meta_file, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch return null;
+    defer file.close(io_mod.getIo());
+    const bytes = io_mod.readFileToEnd(alloc, &file, max_session_meta_bytes) catch return null;
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = parsed.value;
+    if (obj != .object) return null;
+    const root_v = obj.object.get("workspace_root") orelse return null;
+    if (root_v != .string) return null;
+    return scopeFromRoot(alloc, root_v.string) catch null;
+}
+
 /// Render a learning to its `memory/<type>/<slug>.md` key plus full entry
-/// content, or null when the candidate is malformed. Caller owns the
-/// result (Rendered.deinit).
-fn render(alloc: Allocator, learning: Learning) Allocator.Error!?Rendered {
+/// content, or null when the candidate is malformed. `scope` lands only
+/// on project entries: user, feedback, and reference learnings are
+/// global by construction. Caller owns the result (Rendered.deinit).
+fn render(alloc: Allocator, learning: Learning, scope: ?[]const u8) Allocator.Error!?Rendered {
     if (!isLearningType(learning.type)) return null;
     if (learning.title.len == 0 or learning.title.len > max_title_bytes) return null;
     const body = std.mem.trim(u8, learning.body, " \t\r\n");
@@ -144,11 +186,19 @@ fn render(alloc: Allocator, learning: Learning) Allocator.Error!?Rendered {
     const description = try flattenWhitespace(alloc, learning.title);
     defer alloc.free(description);
 
-    const content = try std.fmt.allocPrint(
-        alloc,
-        "---\ntype: {s}\nprovenance: {s}\ndescription: {s}\n---\n\n{s}\n",
-        .{ learning.type, provenance, description, body },
-    );
+    const scoped = scope != null and std.mem.eql(u8, learning.type, "project");
+    const content = if (scoped)
+        try std.fmt.allocPrint(
+            alloc,
+            "---\ntype: {s}\nprovenance: {s}\ndescription: {s}\nscope: {s}\n---\n\n{s}\n",
+            .{ learning.type, provenance, description, scope.?, body },
+        )
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "---\ntype: {s}\nprovenance: {s}\ndescription: {s}\n---\n\n{s}\n",
+            .{ learning.type, provenance, description, body },
+        );
     errdefer alloc.free(content);
     return .{ .key = key, .content = content };
 }
@@ -177,7 +227,7 @@ pub fn readLearningsFile(
 /// Parse one learnings.jsonl line and render it. Returns null for anything
 /// malformed — a bad line must not sink the rest of the session's
 /// learnings. Caller owns the result (Rendered.deinit).
-fn parseLine(alloc: Allocator, line: []const u8) Allocator.Error!?Rendered {
+fn parseLine(alloc: Allocator, line: []const u8, scope: ?[]const u8) Allocator.Error!?Rendered {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return null;
     defer parsed.deinit();
     const obj = parsed.value;
@@ -199,19 +249,23 @@ fn parseLine(alloc: Allocator, line: []const u8) Allocator.Error!?Rendered {
         .slug = slug,
         .title = title_v.string,
         .body = body_v.string,
-    });
+    }, scope);
 }
 
 /// Write one learning immediately — the explicit-save trigger. Returns
 /// false when the signet backend is disabled or the candidate is
-/// malformed; both are clean no-ops, never partial writes.
+/// malformed; both are clean no-ops, never partial writes. `workspace_root`
+/// supplies the scope on project learnings; null leaves them unscoped.
 pub fn saveLearning(
     alloc: Allocator,
     store: *store_redirect.Store,
     learning: Learning,
+    workspace_root: ?[]const u8,
 ) !bool {
     if (!store.signetEnabled()) return false;
-    var rendered = (try render(alloc, learning)) orelse return false;
+    const scope = try scopeFromRoot(alloc, workspace_root);
+    defer if (scope) |s| alloc.free(s);
+    var rendered = (try render(alloc, learning, scope)) orelse return false;
     defer rendered.deinit(alloc);
     try store.writeSurface(alloc, rendered.key, rendered.content);
     return true;
@@ -227,6 +281,8 @@ pub fn captureSessionEnd(
     session_dir: *const io_mod.VerifiedDir,
 ) !void {
     if (!store.signetEnabled()) return;
+    const scope = sessionWorkspaceScope(alloc, session_dir);
+    defer if (scope) |s| alloc.free(s);
     const bytes = (try readLearningsFile(alloc, session_dir)) orelse return;
     defer alloc.free(bytes);
 
@@ -263,7 +319,7 @@ pub fn captureSessionEnd(
         if (keys.items.len >= max_learnings) break;
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
-        var rendered = (try parseLine(alloc, line)) orelse continue;
+        var rendered = (try parseLine(alloc, line, scope)) orelse continue;
         if (seen.contains(rendered.key)) {
             rendered.deinit(alloc);
             continue;
@@ -358,6 +414,13 @@ test "session-end capture writes typed memory entries through the store seam" {
         \\not json at all
         \\
     );
+    // The session's own metadata supplies the workspace scope.
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &session_vd,
+        session_meta_file,
+        "{\"id\":\"sess001\",\"workspace_root\":\"/home/ubuntu/projects/fx-signet\"}",
+    );
 
     try captureSessionEnd(alloc, &store, &session_vd);
 
@@ -365,9 +428,13 @@ test "session-end capture writes typed memory entries through the store seam" {
     try testing.expect(std.mem.find(u8, pref, "type: user") != null);
     try testing.expect(std.mem.find(u8, pref, "provenance: learned:fx") != null);
     try testing.expect(std.mem.find(u8, pref, "pnpm") != null);
+    // User learnings are global: no scope lands even when one is known.
+    try testing.expect(std.mem.find(u8, pref, "scope:") == null);
 
     const decided = mock.entries.get("memory/project/we-decided-to-store-agent-state-in-the.md").?;
     try testing.expect(std.mem.find(u8, decided, "type: project") != null);
+    // The project learning recalls which repo it belongs to.
+    try testing.expect(std.mem.find(u8, decided, "scope: fx-signet") != null);
 
     // Malformed and mistyped lines never land.
     var it = mock.entries.iterator();
@@ -491,7 +558,7 @@ test "explicit saveLearning lands one entry and no-ops when disabled" {
         .type = "feedback",
         .title = "The root cause was a stale manifest seq.",
         .body = "Fixed by re-reading the manifest before push.",
-    }));
+    }, "/home/user/repos/fx-signet"));
     const entry = mock.entries.get("memory/feedback/the-root-cause-was-a-stale-manifest-seq.md").?;
     try testing.expect(std.mem.find(u8, entry, "type: feedback") != null);
     try testing.expect(std.mem.find(u8, entry, "provenance: learned:fx") != null);
@@ -501,7 +568,7 @@ test "explicit saveLearning lands one entry and no-ops when disabled" {
         .type = "evil",
         .title = "x",
         .body = "y",
-    })));
+    }, null)));
 
     var disabled = try store_redirect.Store.init(alloc, home, null);
     defer disabled.deinit();
@@ -509,5 +576,5 @@ test "explicit saveLearning lands one entry and no-ops when disabled" {
         .type = "user",
         .title = "x",
         .body = "y",
-    })));
+    }, null)));
 }

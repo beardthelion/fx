@@ -135,7 +135,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         .title = input.title,
         .body = input.body,
         .slug = input.slug,
-    }) catch |err| switch (err) {
+    }, ctx.workspace_root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MemoryStoreMalformed => return .{ .failure = try ctx.allocator.dupe(
             u8,
@@ -167,12 +167,18 @@ pub fn execute(arena: Allocator, args_json: []const u8) ![]u8 {
         .title = tool_args.optionalStringArg(args, "title"),
         .body = tool_args.optionalStringArg(args, "body"),
         .slug = tool_args.optionalStringArg(args, "slug"),
-    });
+    }, null);
 }
 
 const memories_surface = "memories.json";
 
-fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8, learn_args: LearnArgs) ![]u8 {
+fn runMemory(
+    alloc: Allocator,
+    action: []const u8,
+    fact: ?[]const u8,
+    learn_args: LearnArgs,
+    workspace_root: ?[]const u8,
+) ![]u8 {
     if (!isSupportedAction(action)) return error.UnsupportedMemoryAction;
 
     const home = io_mod.getenv("HOME") orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
@@ -209,7 +215,7 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8, learn_args
             .body = body,
         };
         if (store) |signet| {
-            return learnWithRetry(alloc, signet, learning);
+            return learnWithRetry(alloc, signet, learning, workspace_root);
         }
         // No signet backend: degrade to a flat memory so the fact the
         // agent chose to keep still persists.
@@ -301,11 +307,12 @@ fn learnWithRetry(
     alloc: Allocator,
     store: *store_redirect.Store,
     learning: signet_learn.Learning,
+    workspace_root: ?[]const u8,
 ) ![]u8 {
     var attempt: u8 = 0;
     while (true) {
         attempt += 1;
-        const saved = signet_learn.saveLearning(alloc, store, learning) catch |err| switch (err) {
+        const saved = signet_learn.saveLearning(alloc, store, learning, workspace_root) catch |err| switch (err) {
             error.SignetStaleBase => {
                 if (attempt >= stale_base_max_attempts) return err;
                 continue;
