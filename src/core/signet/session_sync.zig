@@ -308,20 +308,48 @@ pub fn mirrorSession(
         for (records.items) |r| alloc.free(r.sha256);
         records.deinit(alloc);
     }
-    // Each file owns a chunk region sized to its cap, allocated in sorted
-    // order. A file that grows keeps its region, so an append uploads only
-    // the new tail chunks: unchanged chunks land on the same keys and the
-    // backend's ciphertext-hash delta marks them unchanged. Under the old
-    // packed layout, growth shifted every later file's seqs and re-uploaded
-    // them wholesale.
-    var next_seq: u64 = 1;
+    // Each file owns a cap-sized chunk region that persists via the
+    // prior index: a file that appeared before keeps its seqs across
+    // growth and across sibling additions and removals, so an append
+    // uploads only new tail chunks and a removal frees only its own
+    // keys. New or displaced files take the smallest unclaimed range.
+    const Claim = struct { first: u64, end: u64 };
+    var claimed: std.ArrayList(Claim) = .empty;
+    defer claimed.deinit(alloc);
+    const rangeTaken = struct {
+        fn any(list: []const Claim, first: u64, end: u64) bool {
+            for (list) |c| if (first < c.end and c.first < end) return true;
+            return false;
+        }
+    }.any;
     for (names.items) |name| {
         const cap: usize = if (std.mem.eql(u8, name, events_file))
             max_events_bytes
         else
             max_meta_file_bytes;
-        const first = next_seq;
-        next_seq += chunksFor(cap);
+        const stride = chunksFor(cap);
+        var prior_first: ?u64 = null;
+        if (prior) |*p| {
+            for (p.files) |f| {
+                if (std.mem.eql(u8, f.name, name)) {
+                    prior_first = f.first;
+                    break;
+                }
+            }
+        }
+        var first: u64 = undefined;
+        if (prior_first) |pf| {
+            if (!rangeTaken(claimed.items, pf, pf + stride)) {
+                first = pf;
+            } else {
+                first = 1;
+                while (rangeTaken(claimed.items, first, first + stride)) first += 1;
+            }
+        } else {
+            first = 1;
+            while (rangeTaken(claimed.items, first, first + stride)) first += 1;
+        }
+        try claimed.append(alloc, .{ .first = first, .end = first + stride });
         const bytes = (try readBounded(alloc, session_dir, name, cap)) orelse
             try alloc.dupe(u8, "");
         defer alloc.free(bytes);
@@ -693,6 +721,45 @@ test "a grown file keeps its region and does not shift neighbors" {
     defer alloc.free(authority);
     try testing.expectEqual(grown.len, authority.len);
     try testing.expectEqualSlices(u8, grown, authority);
+}
+
+test "a removed file frees its region without shifting neighbors" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var mock = testBackend{};
+    defer mock.deinit(alloc);
+    var store = try store_redirect.Store.init(alloc, home, mock.backend());
+    defer store.deinit();
+
+    var home_vd = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(
+        std.testing.io,
+        ".",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) };
+    defer home_vd.close();
+    var sessions_vd = try io_mod.openOrCreateVerifiedPrivateDir(&home_vd, "sessions");
+    defer sessions_vd.close();
+    var session_vd = try io_mod.openOrCreateVerifiedPrivateDir(&sessions_vd, "sess003");
+    defer session_vd.close();
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "authority.json", "a\n");
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "checkpoint.json", "c\n");
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "events.jsonl", "{\"e\":1}\n");
+
+    try mirrorSession(alloc, &store, &session_vd, "sess003");
+    // Sorted regions: authority.json@1, checkpoint.json@17, events.jsonl@33.
+    try testing.expect(mock.entries.get("sessions/sess003/000033") != null);
+
+    // Drop the first-sorted file. Its chunks leave; checkpoint.json and
+    // events.jsonl keep their regions instead of packing tighter.
+    try session_vd.dir.deleteFile(io_mod.getIo(), "authority.json");
+    try mirrorSession(alloc, &store, &session_vd, "sess003");
+    try testing.expect(mock.entries.get("sessions/sess003/000001") == null);
+    try testing.expect(mock.entries.get("sessions/sess003/000017") != null);
+    try testing.expect(mock.entries.get("sessions/sess003/000033") != null);
 }
 
 test "hydrate returns false when no mirror exists" {
