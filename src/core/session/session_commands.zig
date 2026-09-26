@@ -150,6 +150,8 @@ fn postCommitResolutionError(
             .settings_too_large => return error.SettingsPrimaryTooLarge,
             .durable_path_unsafe => return error.DurablePathUnsafe,
             .private_state_permissions_unsupported => return error.PrivateStatePermissionsUnsupported,
+            .signet_unavailable => return error.SignetUnavailable,
+            .signet_store_error => return error.SignetStoreError,
             .invalid_model_id => return error.InvalidModelValue,
             .retired_skill_match_fuzzy => return error.InvalidSettingsFormat,
             .invalid_context_limits => return error.InvalidSettingsFormat,

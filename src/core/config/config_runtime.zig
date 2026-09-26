@@ -170,6 +170,13 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_additional_directories,
+    /// The Signet state backend was unreachable at config load. Distinct
+    /// from malformed_settings: the file is fine, the remote store is not.
+    signet_unavailable,
+    /// The Signet backend refused or failed integrity/decrypt checks.
+    /// Fail-closed errors keep their own cause rather than masquerading
+    /// as a settings parse failure.
+    signet_store_error,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -745,6 +752,18 @@ fn diagnosticCauseForUserStoreError(err: anyerror) ConfigDiagnosticCause {
     return switch (err) {
         error.DurablePathUnsafe => .durable_path_unsafe,
         error.PrivateStatePermissionsUnsupported => .private_state_permissions_unsupported,
+        error.SignetUnavailable, error.SignetHttpFailed => .signet_unavailable,
+        error.SignetHttp,
+        error.SignetIntegrity,
+        error.SignetDecrypt,
+        error.SignetSkipped,
+        error.SignetProtocol,
+        error.SignetStaleBase,
+        error.SignetStateCorrupt,
+        error.SignetStatePersistFailed,
+        error.SignetSecretsMissing,
+        error.SignetNamespaceInvalid,
+        => .signet_store_error,
         else => .malformed_settings,
     };
 }
@@ -3671,4 +3690,30 @@ test "malformed or duplicate additional directories do not discard sibling setti
         }
         try std.testing.expect(found_diagnostic);
     }
+}
+
+test "signet backend failures keep their own diagnostic cause" {
+    try std.testing.expectEqual(
+        ConfigDiagnosticCause.signet_unavailable,
+        diagnosticCauseForUserStoreError(error.SignetUnavailable),
+    );
+    try std.testing.expectEqual(
+        ConfigDiagnosticCause.signet_unavailable,
+        diagnosticCauseForUserStoreError(error.SignetHttpFailed),
+    );
+    for ([_]anyerror{
+        error.SignetIntegrity,
+        error.SignetDecrypt,
+        error.SignetSecretsMissing,
+        error.SignetStateCorrupt,
+    }) |err| {
+        try std.testing.expectEqual(
+            ConfigDiagnosticCause.signet_store_error,
+            diagnosticCauseForUserStoreError(err),
+        );
+    }
+    try std.testing.expectEqual(
+        ConfigDiagnosticCause.malformed_settings,
+        diagnosticCauseForUserStoreError(error.FileCorrupt),
+    );
 }

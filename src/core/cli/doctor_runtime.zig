@@ -189,6 +189,8 @@ fn configLayerRejected(
             .invalid_model_id,
             .retired_skill_match_fuzzy,
             .invalid_context_limits,
+            .signet_unavailable,
+            .signet_store_error,
             => return true,
             .invalid_additional_directories,
             .ignored_project_user_only_setting,
