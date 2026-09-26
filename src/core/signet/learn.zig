@@ -302,7 +302,7 @@ fn collides(
     existing: *const std.StringHashMapUnmanaged(void),
 ) !?Rendered {
     if (!existing.contains(rendered.key)) return null;
-    const prior = (try store.readSurface(alloc, rendered.key)) orelse return null;
+    const prior = (try store.readSurfaceStrict(alloc, rendered.key)) orelse return null;
     defer alloc.free(prior);
     if (std.mem.eql(u8, prior, rendered.content)) return null;
     const suffix = try hex8(alloc, rendered.content);

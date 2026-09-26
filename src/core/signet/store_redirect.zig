@@ -651,6 +651,22 @@ pub const Store = struct {
     /// degrades to the local copy; refusal, integrity, and decrypt errors
     /// stay fail-closed.
     pub fn readSurface(self: *Store, alloc: Allocator, rel_path: []const u8) BackendError!?[]u8 {
+        return self.readSurfaceInner(alloc, rel_path, true);
+    }
+
+    /// Read with no local fallback: a transport-class failure propagates.
+    /// For write-path verification reads (collision checks), an unseen
+    /// remote entry must fail the operation, not look absent.
+    pub fn readSurfaceStrict(self: *Store, alloc: Allocator, rel_path: []const u8) BackendError!?[]u8 {
+        return self.readSurfaceInner(alloc, rel_path, false);
+    }
+
+    fn readSurfaceInner(
+        self: *Store,
+        alloc: Allocator,
+        rel_path: []const u8,
+        allow_fallback: bool,
+    ) BackendError!?[]u8 {
         if (self.activeBackend()) |b| {
             const route = try routePath(alloc, rel_path);
             switch (route) {
@@ -660,7 +676,7 @@ pub const Store = struct {
                     if (b.read(alloc, key)) |remote| {
                         return remote;
                     } else |err| {
-                        if (!self.isUnavailable(err)) return err;
+                        if (!allow_fallback or !self.isUnavailable(err)) return err;
                         debug_trace.logf(
                             "signet",
                             "remote read unavailable rel={s} err={s}; serving local copy",
