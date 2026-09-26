@@ -631,8 +631,25 @@ pub const Store = struct {
         return null;
     }
 
+    /// Whether a backend error means the remote is unreachable rather
+    /// than refusing or untrustworthy: transport failures and 5xx answers
+    /// degrade to the local surface, while 4xx rejections, integrity
+    /// failures, and decrypt failures stay fail-closed (SN-041 posture).
+    /// An injected test backend has no client status, so its SignetHttp
+    /// stays fatal.
+    fn isUnavailable(self: *const Store, err: BackendError) bool {
+        return switch (err) {
+            error.SignetHttpFailed, error.SignetUnavailable => true,
+            error.SignetHttp => if (self.client) |c| c.last_error.status >= 500 else false,
+            else => false,
+        };
+    }
+
     /// Read a surface's bytes. Disabled or unrouted surfaces read the local
-    /// file; signet surfaces go through the backend.
+    /// file; signet surfaces go through the backend. A transport-class
+    /// backend failure (unreachable, or a 5xx answer through a proxy)
+    /// degrades to the local copy; refusal, integrity, and decrypt errors
+    /// stay fail-closed.
     pub fn readSurface(self: *Store, alloc: Allocator, rel_path: []const u8) BackendError!?[]u8 {
         if (self.activeBackend()) |b| {
             const route = try routePath(alloc, rel_path);
@@ -640,7 +657,16 @@ pub const Store = struct {
                 .local => {},
                 .signet => |key| {
                     defer alloc.free(key);
-                    return b.read(alloc, key);
+                    if (b.read(alloc, key)) |remote| {
+                        return remote;
+                    } else |err| {
+                        if (!self.isUnavailable(err)) return err;
+                        debug_trace.logf(
+                            "signet",
+                            "remote read unavailable rel={s} err={s}; serving local copy",
+                            .{ rel_path, @errorName(err) },
+                        );
+                    }
                 },
             }
         }
@@ -700,7 +726,23 @@ pub const Store = struct {
             }
         }
         if (remote_keys.items.len == 0) return results;
-        const remote_results = try backend.readBatch(alloc, remote_keys.items);
+        const remote_results = backend.readBatch(alloc, remote_keys.items) catch |err| {
+            if (!self.isUnavailable(err)) return err;
+            debug_trace.logf(
+                "signet",
+                "remote batch read unavailable err={s}; serving local copies",
+                .{@errorName(err)},
+            );
+            for (remote_idx.items) |i| {
+                const path = try std.fs.path.join(
+                    alloc,
+                    &.{ self.home, profile_paths.root_dir_name, rel_paths[i] },
+                );
+                defer alloc.free(path);
+                results[i] = try localRead(alloc, path);
+            }
+            return results;
+        };
         // Move the elements into results; remote_results' slice is the
         // only thing left to free.
         defer alloc.free(remote_results);
@@ -955,6 +997,7 @@ pub const MockBackend = struct {
     batch_reads: usize = 0,
     writes: usize = 0,
     deletes: usize = 0,
+    fail_read_with: ?BackendError = null,
 
     pub fn deinit(self: *MockBackend, alloc: Allocator) void {
         var it = self.entries.iterator();
@@ -980,6 +1023,7 @@ pub const MockBackend = struct {
     fn readImpl(ptr: *anyopaque, alloc: Allocator, key: []const u8) BackendError!?[]u8 {
         const self: *MockBackend = @ptrCast(@alignCast(ptr));
         self.reads += 1;
+        if (self.fail_read_with) |e| return e;
         const value = self.entries.get(key) orelse return null;
         return try alloc.dupe(u8, value);
     }
@@ -987,6 +1031,7 @@ pub const MockBackend = struct {
     fn readBatchImpl(ptr: *anyopaque, alloc: Allocator, keys: []const []const u8) BackendError![]?[]u8 {
         const self: *MockBackend = @ptrCast(@alignCast(ptr));
         self.batch_reads += 1;
+        if (self.fail_read_with) |e| return e;
         const results = try alloc.alloc(?[]u8, keys.len);
         @memset(results, null);
         errdefer {
@@ -1200,6 +1245,49 @@ test "enabled store routes signet surfaces through the backend only" {
     }
     try std.testing.expectEqual(@as(usize, 1), session_keys.len);
     try std.testing.expectEqualStrings("sessions/s1/000001", session_keys[0]);
+}
+
+test "unavailable backend reads degrade to the local copy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(alloc, &tmp);
+    defer alloc.free(home);
+
+    // A local copy exists (a local-mode run wrote it before signet was
+    // enabled, or an earlier session mirrored it).
+    var local = try Store.init(alloc, home, null);
+    defer local.deinit();
+    try local.writeSurface(alloc, "memories.json", "[\"m-local\"]\n");
+
+    var mock = MockBackend{ .fail_read_with = error.SignetHttpFailed };
+    defer mock.deinit(alloc);
+    var store = try Store.init(alloc, home, mock.backend());
+    defer store.deinit();
+
+    // Transport failure: the remote is unreachable, the local copy serves.
+    const read_back = (try store.readSurface(alloc, "memories.json")).?;
+    defer alloc.free(read_back);
+    try std.testing.expectEqualStrings("[\"m-local\"]\n", read_back);
+    try std.testing.expectEqual(@as(usize, 1), mock.reads);
+
+    // Batch reads degrade the same way.
+    const surfaces = [_][]const u8{ "memories.json", "settings.json" };
+    const results = try store.readSurfacesBatch(alloc, &surfaces);
+    defer {
+        for (results) |r| if (r) |b| alloc.free(b);
+        alloc.free(results);
+    }
+    try std.testing.expectEqualStrings("[\"m-local\"]\n", results[0].?);
+    try std.testing.expect(results[1] == null);
+    try std.testing.expectEqual(@as(usize, 1), mock.batch_reads);
+
+    // Integrity, refusal, and unclassified failures stay fail-closed. An
+    // injected backend has no client status, so SignetHttp stays fatal here.
+    mock.fail_read_with = error.SignetIntegrity;
+    try std.testing.expectError(error.SignetIntegrity, store.readSurface(alloc, "memories.json"));
+    mock.fail_read_with = error.SignetHttp;
+    try std.testing.expectError(error.SignetHttp, store.readSurface(alloc, "memories.json"));
 }
 
 // ─── Wire-level tests through the scripted server ───────────────────────
