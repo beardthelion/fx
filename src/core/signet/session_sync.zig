@@ -298,12 +298,20 @@ pub fn mirrorSession(
         for (records.items) |r| alloc.free(r.sha256);
         records.deinit(alloc);
     }
+    // Each file owns a chunk region sized to its cap, allocated in sorted
+    // order. A file that grows keeps its region, so an append uploads only
+    // the new tail chunks: unchanged chunks land on the same keys and the
+    // backend's ciphertext-hash delta marks them unchanged. Under the old
+    // packed layout, growth shifted every later file's seqs and re-uploaded
+    // them wholesale.
     var next_seq: u64 = 1;
     for (names.items) |name| {
         const cap: usize = if (std.mem.eql(u8, name, events_file))
             max_events_bytes
         else
             max_meta_file_bytes;
+        const first = next_seq;
+        next_seq += chunksFor(cap);
         const bytes = (try readBounded(alloc, session_dir, name, cap)) orelse
             try alloc.dupe(u8, "");
         defer alloc.free(bytes);
@@ -328,7 +336,7 @@ pub fn mirrorSession(
             errdefer alloc.free(sha_copy);
             const r: FileRecord = .{
                 .name = name,
-                .first = next_seq,
+                .first = first,
                 .chunks = n_chunks,
                 .bytes = bytes.len,
                 .sha256 = sha_copy,
@@ -353,7 +361,7 @@ pub fn mirrorSession(
                 const start: usize = @intCast(seq * event_chunk_bytes);
                 const end = @min(start + event_chunk_bytes, bytes.len);
                 {
-                    const rel = try chunkRel(alloc, session_id, next_seq + seq);
+                    const rel = try chunkRel(alloc, session_id, first + seq);
                     errdefer alloc.free(rel);
                     try rel_paths.append(alloc, rel);
                 }
@@ -364,7 +372,6 @@ pub fn mirrorSession(
                 }
             }
         }
-        next_seq += n_chunks;
     }
 
     {
@@ -581,12 +588,15 @@ test "mirror then hydrate reproduces the session directory" {
 
     try mirrorSession(alloc, &store, &session_vd, "sess001");
 
-    // Every remote key conforms to sessions/<id>/<seq> (SN-022).
+    // Every remote key conforms to sessions/<id>/<seq> (SN-022). Regions
+    // are cap-sized per file: authority.json at seq 1, events.jsonl at 17
+    // (16-chunk meta stride), session.json at 1041 (1024-chunk events
+    // stride).
     try testing.expect(mock.entries.get("sessions/sess001/000000") != null);
     try testing.expect(mock.entries.get("sessions/sess001/000001") != null);
-    try testing.expect(mock.entries.get("sessions/sess001/000002") != null);
-    try testing.expect(mock.entries.get("sessions/sess001/000003") != null);
-    try testing.expect(mock.entries.get("sessions/sess001/000004") == null);
+    try testing.expect(mock.entries.get("sessions/sess001/000017") != null);
+    try testing.expect(mock.entries.get("sessions/sess001/001041") != null);
+    try testing.expect(mock.entries.get("sessions/sess001/000002") == null);
     var kit = mock.entries.iterator();
     while (kit.next()) |kv| {
         try testing.expect(client_mod.isValidEntryKey(kv.key_ptr.*));
@@ -613,6 +623,66 @@ test "mirror then hydrate reproduces the session directory" {
     const meta = (try readBounded(alloc, &restored, "session.json", max_meta_file_bytes)).?;
     defer alloc.free(meta);
     try testing.expectEqualStrings("{\"id\":\"sess001\"}\n", meta);
+}
+
+test "a grown file keeps its region and does not shift neighbors" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var mock = testBackend{};
+    defer mock.deinit(alloc);
+    var store = try store_redirect.Store.init(alloc, home, mock.backend());
+    defer store.deinit();
+
+    var home_vd = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(
+        std.testing.io,
+        ".",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) };
+    defer home_vd.close();
+    var sessions_vd = try io_mod.openOrCreateVerifiedPrivateDir(&home_vd, "sessions");
+    defer sessions_vd.close();
+    var session_vd = try io_mod.openOrCreateVerifiedPrivateDir(&sessions_vd, "sess002");
+    defer session_vd.close();
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "session.json", "{\"id\":\"sess002\"}\n");
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "events.jsonl", "{\"e\":1}\n");
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "authority.json", "a\n");
+
+    try mirrorSession(alloc, &store, &session_vd, "sess002");
+
+    // Grow the first-sorted file past a chunk boundary. Under the packed
+    // layout this moved every later file's chunks to new seqs.
+    const grown = try alloc.alloc(u8, event_chunk_bytes + 16);
+    defer alloc.free(grown);
+    @memset(grown, 'a');
+    try io_mod.durableReplaceVerified(alloc, &session_vd, "authority.json", grown);
+    try mirrorSession(alloc, &store, &session_vd, "sess002");
+
+    try testing.expect(mock.entries.get("sessions/sess002/000001") != null);
+    try testing.expect(mock.entries.get("sessions/sess002/000002") != null);
+    try testing.expect(mock.entries.get("sessions/sess002/000017") != null);
+    try testing.expect(mock.entries.get("sessions/sess002/001041") != null);
+    // Hydration still reconstructs the grown file byte-exactly.
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var home2_vd = io_mod.VerifiedDir{ .dir = try tmp2.dir.openDir(
+        std.testing.io,
+        ".",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) };
+    defer home2_vd.close();
+    var sessions2_vd = try io_mod.openOrCreateVerifiedPrivateDir(&home2_vd, "sessions");
+    defer sessions2_vd.close();
+    try testing.expect(try hydrateSession(alloc, &store, &sessions2_vd, "sess002"));
+    var restored = try io_mod.openOrCreateVerifiedPrivateDir(&sessions2_vd, "sess002");
+    defer restored.close();
+    const authority = (try readBounded(alloc, &restored, "authority.json", max_meta_file_bytes)).?;
+    defer alloc.free(authority);
+    try testing.expectEqual(grown.len, authority.len);
+    try testing.expectEqualSlices(u8, grown, authority);
 }
 
 test "hydrate returns false when no mirror exists" {
