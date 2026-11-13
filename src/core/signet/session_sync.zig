@@ -54,12 +54,16 @@ fn isMirroredFile(name: []const u8) bool {
         }
     }
     if (std.mem.eql(u8, name, events_file)) return true;
+    // transcript.json is the foreign-harness member (SN-023): a vendor
+    // session export mirrored verbatim with a synthesized session.json,
+    // so non-fx sessions archive losslessly rather than converting.
     for ([_][]const u8{
         "session.json",
         "checkpoint.json",
         "display.json",
         "authority.json",
         "usage-v2.json",
+        "transcript.json",
     }) |w| {
         if (std.mem.eql(u8, name, w)) return true;
     }
@@ -591,6 +595,21 @@ fn putMockEntry(mock: *testBackend, alloc: Allocator, key: []const u8, value: []
     const owned_value = try alloc.dupe(u8, value);
     errdefer alloc.free(owned_value);
     try mock.entries.put(alloc, owned_key, owned_value);
+}
+
+test "member allowlist accepts the mirrored set only" {
+    try testing.expect(isMirroredFile("events.jsonl"));
+    try testing.expect(isMirroredFile("session.json"));
+    try testing.expect(isMirroredFile("checkpoint.json"));
+    try testing.expect(isMirroredFile("display.json"));
+    try testing.expect(isMirroredFile("authority.json"));
+    try testing.expect(isMirroredFile("usage-v2.json"));
+    try testing.expect(isMirroredFile("transcript.json"));
+    try testing.expect(isMirroredFile("commit.a1b2c3.json"));
+    try testing.expect(!isMirroredFile("commit.pending.json"));
+    try testing.expect(!isMirroredFile("session.lock"));
+    try testing.expect(!isMirroredFile("notes.md"));
+    try testing.expect(!isMirroredFile("../escape.json"));
 }
 
 test "mirror then hydrate reproduces the session directory" {
